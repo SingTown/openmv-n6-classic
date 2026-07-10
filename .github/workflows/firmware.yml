@@ -40,39 +40,11 @@ jobs:
     strategy:
       matrix:
         target:
-          - OPENMV2
-          - OPENMV3
-          - OPENMV4
-          - OPENMV4P
-          - OPENMVPT
-          - OPENMV_RT1060
-          - OPENMV_AE3
           - OPENMV_N6
-          - ARDUINO_PORTENTA_H7
-          - ARDUINO_GIGA
-          - ARDUINO_NICLA_VISION
         qemu: [false]
         fvp: [false]
         profile: [0]
         artifacts: [true]
-        include:
-          - target: DOCKER
-            qemu: false
-            profile: 0
-            artifacts: false
-          - target: OPENMV_N6
-            qemu: false
-            profile: 1
-            artifacts: false
-          - target: MPS2_AN500
-            qemu: true
-            profile: 0
-            artifacts: false
-          - target: MPS3_AN547
-            qemu: false
-            fvp: true
-            profile: 0
-            artifacts: false
       fail-fast: false
     steps:
     - name: '⏳ Checkout repository'
@@ -130,7 +102,7 @@ jobs:
       if: matrix.artifacts
       uses: actions/upload-artifact@v7
       with:
-        name: ${{ matrix.target }}
+        name: OPENMV_N6_CLASSIC
         path: ${{ matrix.target }}
         if-no-files-found: error
 
@@ -197,7 +169,8 @@ jobs:
     - name: '↓ Download artifacts'
       uses: actions/download-artifact@v8
       with:
-        path: firmware
+        name: OPENMV_N6_CLASSIC
+        path: firmware/OPENMV_N6_CLASSIC
 
     - name: '📦 Package firmware'
       run: source tools/ci.sh && ci_package_firmware_release ${{github.ref_name}}
@@ -241,7 +214,8 @@ jobs:
     - name: '↓ Download artifacts'
       uses: actions/download-artifact@v8
       with:
-        path: firmware
+        name: OPENMV_N6_CLASSIC
+        path: firmware/OPENMV_N6_CLASSIC
 
     - name: '📦 Package firmware'
       run: source tools/ci.sh && ci_package_firmware_development
