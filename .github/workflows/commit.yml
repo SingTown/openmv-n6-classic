@@ -17,7 +17,9 @@ jobs:
       - name: '📜 Check commit messages format'
         uses: gsactions/commit-message-checker@v2
         with:
-          pattern: '^[^!]+: [A-Za-z]+.+ .+$'
+          # Merge commits are accepted as they are: a merge of upstream brings in its
+          # pull request merge commits, and those cannot be reworded.
+          pattern: '^([^!]+: [A-Za-z]+.+ .+|Merge (pull request #[0-9]+ from|branch|remote-tracking branch|tag) .+)$'
           flags: 'gm'
           error: 'Commit subject line must match the following pattern: <scope>: <description>'
           excludeTitle: 'false'
