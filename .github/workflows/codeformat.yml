@@ -39,6 +39,7 @@ jobs:
         config-path: 'tools/uncrustify.cfg'
         extensions: 'c,cc,h'
         exclude-patterns: |
+          boards/*/micropython/**
           cubeai/**
           docker/**
           docs/**

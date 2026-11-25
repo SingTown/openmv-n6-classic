@@ -40,7 +40,7 @@ jobs:
     strategy:
       matrix:
         target:
-          - OPENMV_N6
+          - OPENMV_N6_CLASSIC
         qemu: [false]
         fvp: [false]
         profile: [0]
