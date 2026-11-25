@@ -48,7 +48,7 @@
 
 #define OMV_UMA_BLOCK0_MEMORY                 PSRAM
 #define OMV_UMA_BLOCK0_SIZE                   (8M)
-#define OMV_UMA_BLOCK0_FLAGS                  (0)
+#define OMV_UMA_BLOCK0_FLAGS                  (UMA_EXTERNAL | UMA_DEFAULT)
 
 #define OMV_UMA_BLOCK1_MEMORY                 PSRAM
 #define OMV_UMA_BLOCK1_SIZE                   (2M)
@@ -60,7 +60,7 @@
 
 #define OMV_UMA_BLOCK3_MEMORY                 PSRAM
 #define OMV_UMA_BLOCK3_SIZE                   (128K)
-#define OMV_UMA_BLOCK3_FLAGS                  (UMA_ITCM)
+#define OMV_UMA_BLOCK3_FLAGS                  (UMA_TRANSIENT)
 
 // Memory map.
 #define OMV_SRAM1_ORIGIN                      0x20000000
@@ -85,6 +85,8 @@
 #define OMV_CSI_CLK_FREQUENCY                 (24000000)
 #define OMV_CSI_HW_CROP_ENABLE                (0)
 #define OMV_CSI_MAX_DEVICES                   (3)
+#define OMV_CSI_STATS_ENABLE                  (1)
+#define OMV_CSI_STATS_IMAGE_ENABLE            (1)
 
 #define OMV_SOFTCSI_ENABLE                    (1)
 #endif //__BOARD_CONFIG_H__

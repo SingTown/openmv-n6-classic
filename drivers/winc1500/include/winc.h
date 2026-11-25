@@ -27,6 +27,7 @@
 #define __WINC_H__
 #include <stdint.h>
 #include <stdbool.h>
+#include "board_config.h"
 #define WINC_IPV4_ADDR_LEN      (4)
 #define WINC_MAC_ADDR_LEN       (6)
 #define WINC_MAX_SSID_LEN       (33)
@@ -35,10 +36,20 @@
 // NOTE: Due to the way the WINC1500 HIF is designed, a single recv() call reads all the data received on the socket, which
 // can result in multiple callbacks if the received data is more than the buffer size passed to the recv() call. As a result,
 // the async call handler will keep overwriting the user-provided buffer in subsequent callbacks. The socket buffer is used
-// as workaround to this issue to allow receiving partial packets. Note the maximum size of WINC internal socket buffer seems
-// to change with host-driver/firmware updates. It's very important to make sure this value is still valid after an update.
-#define WINC_SOCKBUF_MAX_SIZE   (1480)
+// as workaround to this issue to allow receiving partial packets.
+// The size sets the receive throughput (8K is the measured knee), and one buffer is allocated per stream socket.
+#ifndef OMV_WINC_SOCKBUF_SIZE
+#define OMV_WINC_SOCKBUF_SIZE   (8192)
+#endif
+#define WINC_SOCKBUF_MAX_SIZE   (OMV_WINC_SOCKBUF_SIZE)
+// The maximum datagram size the firmware delivers in response to a single recvfrom() request.
+#define WINC_MAX_DGRAM_SIZE     (1480)
 #define WINC_REQUEST_TIMEOUT    (5000)
+// A scan sweeps every channel and then fetches each result, so it needs a much
+// larger budget than a single request.
+#define WINC_SCAN_TIMEOUT       (10000)
+// Association plus DHCP, which is much slower than a single request.
+#define WINC_CONNECT_TIMEOUT    (20000)
 
 #define MAKE_SOCKADDR(addr, ip, port) \
     struct sockaddr addr; \
@@ -117,6 +128,7 @@ typedef struct {
 typedef struct {
     int idx;
     int size;
+    bool closed;
     uint8_t buf[WINC_SOCKBUF_MAX_SIZE];
 } winc_socket_buf_t;
 
@@ -134,7 +146,7 @@ int winc_wait_for_sta(uint32_t *sta_ip, uint32_t timeout);
 int winc_ifconfig(winc_ifconfig_t *ifconfig, bool set);
 int winc_netinfo(winc_netinfo_t *netinfo);
 int winc_scan(winc_scan_callback_t cb, void *arg);
-int winc_get_rssi();
+int winc_get_rssi(int *rssi);
 int winc_fw_version(winc_fwver_t *wfwver);
 int winc_flash_dump(const char *path);
 int winc_flash_erase();

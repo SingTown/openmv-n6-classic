@@ -44,6 +44,8 @@
 #include "py_assert.h"
 #include "py_helper.h"
 #include "py_image.h"
+#include "py_image_descriptor.h"
+#include "py_image_stats.h"
 #include "board_config.h"
 #if defined(IMLIB_ENABLE_IMAGE_IO)
 #include "py_imageio.h"
@@ -52,129 +54,6 @@
 #include "simd.h"
 
 const mp_obj_type_t py_image_type;
-
-// Haar Cascade ///////////////////////////////////////////////////////////////
-
-#ifdef IMLIB_ENABLE_FEATURES
-static const mp_obj_type_t py_cascade_type;
-
-typedef struct _py_cascade_obj_t {
-    mp_obj_base_t base;
-    struct cascade _cobj;
-} py_cascade_obj_t;
-
-void *py_cascade_cobj(mp_obj_t cascade) {
-    PY_ASSERT_TYPE(cascade, &py_cascade_type);
-    return &((py_cascade_obj_t *) cascade)->_cobj;
-}
-
-static void py_cascade_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind) {
-    py_cascade_obj_t *self = self_in;
-    mp_printf(print, "{\"width\":%d, \"height\":%d, \"n_stages\":%d, \"n_features\":%d, \"n_rectangles\":%d}",
-              self->_cobj.window.w, self->_cobj.window.h, self->_cobj.n_stages,
-              self->_cobj.n_features, self->_cobj.n_rectangles);
-}
-
-static MP_DEFINE_CONST_OBJ_TYPE(
-    py_cascade_type,
-    MP_QSTR_Cascade,
-    MP_TYPE_FLAG_NONE,
-    print, py_cascade_print
-    );
-#endif // IMLIB_ENABLE_FEATURES
-
-// Keypoints object ///////////////////////////////////////////////////////////
-
-#ifdef IMLIB_ENABLE_FIND_KEYPOINTS
-
-typedef struct _py_kp_obj_t {
-    mp_obj_base_t base;
-    array_t *kpts;
-    int threshold;
-    bool normalized;
-} py_kp_obj_t;
-
-static void py_kp_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind) {
-    py_kp_obj_t *self = self_in;
-    mp_printf(print,
-              "{\"size\":%d, \"threshold\":%d, \"normalized\":%d}",
-              array_length(self->kpts),
-              self->threshold,
-              self->normalized);
-}
-
-mp_obj_t py_kp_unary_op(mp_unary_op_t op, mp_obj_t self_in) {
-    py_kp_obj_t *self = MP_OBJ_TO_PTR(self_in);
-    switch (op) {
-        case MP_UNARY_OP_LEN:
-            return MP_OBJ_NEW_SMALL_INT(array_length(self->kpts));
-
-        default:
-            return MP_OBJ_NULL; // op not supported
-    }
-}
-
-static mp_obj_t py_kp_subscr(mp_obj_t self_in, mp_obj_t index, mp_obj_t value) {
-    if (value == MP_OBJ_SENTINEL) {
-        // load
-        py_kp_obj_t *self = self_in;
-        int size = array_length(self->kpts);
-        int i = mp_get_index(self->base.type, size, index, false);
-        kp_t *kp = array_at(self->kpts, i);
-        return mp_obj_new_tuple(5, (mp_obj_t []) {mp_obj_new_int(kp->x),
-                                                  mp_obj_new_int(kp->y),
-                                                  mp_obj_new_int(kp->score),
-                                                  mp_obj_new_int(kp->octave),
-                                                  mp_obj_new_int(kp->angle)});
-    }
-
-    return MP_OBJ_NULL; // op not supported
-}
-
-static MP_DEFINE_CONST_OBJ_TYPE(
-    py_kp_type,
-    MP_QSTR_kp_desc,
-    MP_TYPE_FLAG_NONE,
-    print, py_kp_print,
-    subscr, py_kp_subscr,
-    unary_op, py_kp_unary_op
-    );
-
-py_kp_obj_t *py_kpts_obj(mp_obj_t kpts_obj) {
-    PY_ASSERT_TYPE(kpts_obj, &py_kp_type);
-    return kpts_obj;
-}
-
-#endif // IMLIB_ENABLE_FIND_KEYPOINTS
-
-// LBP descriptor /////////////////////////////////////////////////////////////
-
-#ifdef IMLIB_ENABLE_FIND_LBP
-
-typedef struct _py_lbp_obj_t {
-    mp_obj_base_t base;
-    uint8_t *hist;
-} py_lbp_obj_t;
-
-static void py_lbp_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind) {
-    mp_printf(print, "{}");
-}
-
-static MP_DEFINE_CONST_OBJ_TYPE(
-    py_lbp_type,
-    MP_QSTR_lbp_desc,
-    MP_TYPE_FLAG_NONE,
-    print, py_lbp_print
-    );
-#endif // IMLIB_ENABLE_FIND_LBP
-
-// Keypoints Match Object /////////////////////////////////////////////////////
-
-#if defined(IMLIB_ENABLE_DESCRIPTOR) && defined(IMLIB_ENABLE_FIND_KEYPOINTS)
-
-
-
-#endif //IMLIB_ENABLE_DESCRIPTOR && IMLIB_ENABLE_FIND_KEYPOINTS
 
 // Image //////////////////////////////////////////////////////////////////////
 
@@ -610,10 +489,11 @@ static MP_DEFINE_CONST_FUN_OBJ_1(py_image_bytearray_obj, py_image_bytearray);
 
 #if defined(MODULE_ULAB_ENABLED) && (ULAB_MAX_DIMS == 4)
 static mp_obj_t py_image_to_ndarray(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
-    enum { ARG_dtype, ARG_buffer };
+    enum { ARG_dtype, ARG_buffer, ARG_channels_first };
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_dtype, MP_ARG_OBJ | MP_ARG_REQUIRED, {.u_rom_obj = MP_ROM_NONE } },
         { MP_QSTR_buffer, MP_ARG_OBJ | MP_ARG_KW_ONLY, {.u_rom_obj = MP_ROM_NONE} },
+        { MP_QSTR_channels_first, MP_ARG_BOOL | MP_ARG_KW_ONLY, {.u_bool = false} },
     };
 
     image_t *image = py_helper_arg_to_image(pos_args[0], ARG_IMAGE_ANY);
@@ -621,6 +501,7 @@ static mp_obj_t py_image_to_ndarray(size_t n_args, const mp_obj_t *pos_args, mp_
     mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
     int len = image->w * image->h;
+    bool channels_first = args[ARG_channels_first].u_bool;
 
     int dtype_code;
     int dtype_size;
@@ -660,7 +541,11 @@ static mp_obj_t py_image_to_ndarray(size_t n_args, const mp_obj_t *pos_args, mp_
             break;
         }
         case PIXFORMAT_RGB565: {
-            memcpy(shape, (size_t []) {0, image->h, image->w, 3}, sizeof(shape));
+            if (channels_first) {
+                memcpy(shape, (size_t []) {0, 3, image->h, image->w}, sizeof(shape));
+            } else {
+                memcpy(shape, (size_t []) {0, image->h, image->w, 3}, sizeof(shape));
+            }
             channels = 3;
             ndim = 3;
             break;
@@ -724,10 +609,39 @@ static mp_obj_t py_image_to_ndarray(size_t n_args, const mp_obj_t *pos_args, mp_
         uint16_t *input_u16 = (uint16_t *) image->data;
         int i = 0, j = 0;
 
-        if (dtype_code == 'f') {
+        if (dtype_code == 'f' && channels_first) {
+            // Planar output: the R, G and B planes follow each other.
+            float *output_r = (float *) ndarray->array;
+            float *output_g = output_r + len;
+            float *output_b = output_g + len;
+
+            #if (__ARM_ARCH >= 8)
+            // r0 holds the even pixels and r1 the odd pixels of each vector.
+            v128_t offsets = vmul_n_u32(vidup_u32(0, 1), 2);
+            for (; i < (len & ~(UINT16_VECTOR_SIZE - 1)); i += UINT16_VECTOR_SIZE) {
+                vrgb_pixels_t pixels = vrgb_rgb565_to_pixels888(vldr_u16(input_u16 + i));
+                v2x_rows_t pixels_r = vcvt_u16_f32(vand_u32(pixels.r, vdup_u16(0xff)));
+                vstr_f32_scatter(output_r + i + 0, offsets, pixels_r.r0);
+                vstr_f32_scatter(output_r + i + 1, offsets, pixels_r.r1);
+                v2x_rows_t pixels_g = vcvt_u16_f32(vand_u32(pixels.g, vdup_u16(0xff)));
+                vstr_f32_scatter(output_g + i + 0, offsets, pixels_g.r0);
+                vstr_f32_scatter(output_g + i + 1, offsets, pixels_g.r1);
+                v2x_rows_t pixels_b = vcvt_u16_f32(vand_u32(pixels.b, vdup_u16(0xff)));
+                vstr_f32_scatter(output_b + i + 0, offsets, pixels_b.r0);
+                vstr_f32_scatter(output_b + i + 1, offsets, pixels_b.r1);
+            }
+            #endif // __ARM_ARCH >= 8
+
+            for (; i < len; i++) {
+                int pixel = input_u16[i];
+                output_r[i] = COLOR_RGB565_TO_R8(pixel);
+                output_g[i] = COLOR_RGB565_TO_G8(pixel);
+                output_b[i] = COLOR_RGB565_TO_B8(pixel);
+            }
+        } else if (dtype_code == 'f') {
             float *output_f32 = (float *) ndarray->array;
 
-            #if FLOAT32_VECTOR_SIZE > 1
+            #if (__ARM_ARCH >= 8)
             v128_t offsets = vmul_n_u32(vidup_u32(0, 1), 6);
             for (; i < (len & ~(UINT16_VECTOR_SIZE - 1)); i += UINT16_VECTOR_SIZE, j += (3 * UINT16_VECTOR_SIZE)) {
                 vrgb_pixels_t pixels = vrgb_rgb565_to_pixels888(vldr_u16(input_u16 + i));
@@ -741,13 +655,26 @@ static mp_obj_t py_image_to_ndarray(size_t n_args, const mp_obj_t *pos_args, mp_
                 vstr_f32_scatter(output_f32 + j + 2, offsets, pixels_b.r0);
                 vstr_f32_scatter(output_f32 + j + 5, offsets, pixels_b.r1);
             }
-            #endif // FLOAT32_VECTOR_SIZE > 1
+            #endif // __ARM_ARCH >= 8
 
             for (; i < len; i++, j += 3) {
                 int pixel = input_u16[i];
                 output_f32[j + 0] = COLOR_RGB565_TO_R8(pixel);
                 output_f32[j + 1] = COLOR_RGB565_TO_G8(pixel);
                 output_f32[j + 2] = COLOR_RGB565_TO_B8(pixel);
+            }
+        } else if (channels_first) {
+            // Planar 8-bit output. Signed outputs are offset by 128.
+            uint8_t *output_r = (uint8_t *) ndarray->array;
+            uint8_t *output_g = output_r + len;
+            uint8_t *output_b = output_g + len;
+            uint8_t offset = (dtype_code == 'b') ? 0x80 : 0;
+
+            for (; i < len; i++) {
+                int pixel = input_u16[i];
+                output_r[i] = COLOR_RGB565_TO_R8(pixel) ^ offset;
+                output_g[i] = COLOR_RGB565_TO_G8(pixel) ^ offset;
+                output_b[i] = COLOR_RGB565_TO_B8(pixel) ^ offset;
             }
         } else {
             uint8_t *output_u8 = (uint8_t *) ndarray->array;
@@ -852,7 +779,11 @@ static mp_obj_t py_image_get_pixel(size_t n_args, const mp_obj_t *pos_args, mp_m
         }
         case PIXFORMAT_BAYER_ANY:
             if (arg_rgbtuple) {
-                uint16_t pixel; imlib_debayer_line(arg_x, arg_x + 1, arg_y, &pixel, PIXFORMAT_RGB565, arg_img);
+                // Line functions store pixels at their source column.
+                uint16_t *row = uma_malloc(arg_img->w * sizeof(uint16_t), UMA_FAST);
+                imlib_debayer_line(arg_x, arg_x + 1, arg_y, row, PIXFORMAT_RGB565, arg_img);
+                uint16_t pixel = row[arg_x];
+                uma_free(row);
                 mp_obj_t pixel_tuple[3];
                 pixel_tuple[0] = mp_obj_new_int(COLOR_RGB565_TO_R8(pixel));
                 pixel_tuple[1] = mp_obj_new_int(COLOR_RGB565_TO_G8(pixel));
@@ -863,7 +794,11 @@ static mp_obj_t py_image_get_pixel(size_t n_args, const mp_obj_t *pos_args, mp_m
             }
         case PIXFORMAT_YUV_ANY:
             if (arg_rgbtuple) {
-                uint16_t pixel; imlib_deyuv_line(arg_x, arg_x + 1, arg_y, &pixel, PIXFORMAT_RGB565, arg_img);
+                // Line functions store pixels at their source column.
+                uint16_t *row = uma_malloc(arg_img->w * sizeof(uint16_t), UMA_FAST);
+                imlib_deyuv_line(arg_x, arg_x + 1, arg_y, row, PIXFORMAT_RGB565, arg_img);
+                uint16_t pixel = row[arg_x];
+                uma_free(row);
                 mp_obj_t pixel_tuple[3];
                 pixel_tuple[0] = mp_obj_new_int(COLOR_RGB565_TO_R8(pixel));
                 pixel_tuple[1] = mp_obj_new_int(COLOR_RGB565_TO_G8(pixel));
@@ -976,13 +911,6 @@ static mp_obj_t py_image_to(pixformat_t pixfmt, mp_rom_obj_t default_color_palet
 
     float *transform = py_helper_arg_to_transform(args[ARG_transform].u_obj);
 
-    if (args[ARG_copy_to_fb].u_bool) {
-        framebuffer_t *fb = framebuffer_get(FB_MAINFB_ID);
-        image_t tmp;
-        framebuffer_to_image(fb, &tmp);
-        framebuffer_update_preview(&tmp);
-    }
-
     image_t dst_img = {
         .w = fast_floorf(roi.w * x_scale),
         .h = fast_floorf(roi.h * y_scale),
@@ -1059,7 +987,7 @@ static mp_obj_t py_image_to(pixformat_t pixfmt, mp_rom_obj_t default_color_palet
             }
 
             if (((dst_img.pixfmt == PIXFORMAT_JPEG) &&
-                 jpeg_compress(&temp, &dst_img_tmp, args[ARG_quality].u_int, false, args[ARG_subsampling].u_int))
+                 jpeg_compress(&temp, &dst_img_tmp, args[ARG_quality].u_int, args[ARG_subsampling].u_int))
                 || ((dst_img.pixfmt == PIXFORMAT_PNG) && png_compress(&temp, &dst_img_tmp))) {
                 mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("Compression Failed!"));
             }
@@ -2740,10 +2668,6 @@ static MP_DEFINE_CONST_FUN_OBJ_KW(py_image_rotation_corr_obj, 1, py_image_rotati
 //////////////
 
 #ifdef IMLIB_ENABLE_GET_SIMILARITY
-static const qstr similarity_fields[] = {
-    MP_QSTR_mean, MP_QSTR_stdev, MP_QSTR_min, MP_QSTR_max
-};
-
 static mp_obj_t py_image_get_similarity(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     enum {
         ARG_image, ARG_x, ARG_y, ARG_x_scale, ARG_y_scale, ARG_roi,
@@ -2803,235 +2727,6 @@ static mp_obj_t py_image_get_similarity(size_t n_args, const mp_obj_t *pos_args,
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(py_image_get_similarity_obj, 1, py_image_get_similarity);
 #endif // IMLIB_ENABLE_GET_SIMILARITY
-
-// Statistics Object //
-static const qstr statistics_fields[] = {
-    MP_QSTR_mean, MP_QSTR_median, MP_QSTR_mode, MP_QSTR_stdev,
-    MP_QSTR_min, MP_QSTR_max, MP_QSTR_lq, MP_QSTR_uq,
-    MP_QSTR_l_mean, MP_QSTR_l_median, MP_QSTR_l_mode, MP_QSTR_l_stdev,
-    MP_QSTR_l_min, MP_QSTR_l_max, MP_QSTR_l_lq, MP_QSTR_l_uq,
-    MP_QSTR_a_mean, MP_QSTR_a_median, MP_QSTR_a_mode, MP_QSTR_a_stdev,
-    MP_QSTR_a_min, MP_QSTR_a_max, MP_QSTR_a_lq, MP_QSTR_a_uq,
-    MP_QSTR_b_mean, MP_QSTR_b_median, MP_QSTR_b_mode, MP_QSTR_b_stdev,
-    MP_QSTR_b_min, MP_QSTR_b_max, MP_QSTR_b_lq, MP_QSTR_b_uq,
-};
-
-static mp_obj_t py_statistics_attrtuple(statistics_t *stats) {
-    mp_obj_t items[] = {
-        mp_obj_new_int(stats->LMean),  mp_obj_new_int(stats->LMedian),
-        mp_obj_new_int(stats->LMode),  mp_obj_new_int(stats->LSTDev),
-        mp_obj_new_int(stats->LMin),   mp_obj_new_int(stats->LMax),
-        mp_obj_new_int(stats->LLQ),    mp_obj_new_int(stats->LUQ),
-        mp_obj_new_int(stats->LMean),  mp_obj_new_int(stats->LMedian),
-        mp_obj_new_int(stats->LMode),  mp_obj_new_int(stats->LSTDev),
-        mp_obj_new_int(stats->LMin),   mp_obj_new_int(stats->LMax),
-        mp_obj_new_int(stats->LLQ),    mp_obj_new_int(stats->LUQ),
-        mp_obj_new_int(stats->AMean),  mp_obj_new_int(stats->AMedian),
-        mp_obj_new_int(stats->AMode),  mp_obj_new_int(stats->ASTDev),
-        mp_obj_new_int(stats->AMin),   mp_obj_new_int(stats->AMax),
-        mp_obj_new_int(stats->ALQ),    mp_obj_new_int(stats->AUQ),
-        mp_obj_new_int(stats->BMean),  mp_obj_new_int(stats->BMedian),
-        mp_obj_new_int(stats->BMode),  mp_obj_new_int(stats->BSTDev),
-        mp_obj_new_int(stats->BMin),   mp_obj_new_int(stats->BMax),
-        mp_obj_new_int(stats->BLQ),    mp_obj_new_int(stats->BUQ),
-    };
-    return mp_obj_new_attrtuple(statistics_fields, MP_ARRAY_SIZE(statistics_fields), items);
-}
-
-// Percentile Object //
-static const qstr percentile_fields[] = {
-    MP_QSTR_value, MP_QSTR_l_value, MP_QSTR_a_value, MP_QSTR_b_value
-};
-
-// Threshold Object //
-static const qstr threshold_fields[] = {
-    MP_QSTR_value, MP_QSTR_l_value, MP_QSTR_a_value, MP_QSTR_b_value
-};
-
-// Histogram Object //
-#define py_histogram_obj_size    3
-typedef struct py_histogram_obj {
-    mp_obj_base_t base;
-    pixformat_t pixfmt;
-    mp_obj_t LBins, ABins, BBins;
-} py_histogram_obj_t;
-
-static void py_histogram_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind) {
-    py_histogram_obj_t *self = self_in;
-    switch (self->pixfmt) {
-        case PIXFORMAT_BINARY: {
-            mp_printf(print, "{\"bins\":");
-            mp_obj_print_helper(print, self->LBins, kind);
-            mp_printf(print, "}");
-            break;
-        }
-        case PIXFORMAT_GRAYSCALE: {
-            mp_printf(print, "{\"bins\":");
-            mp_obj_print_helper(print, self->LBins, kind);
-            mp_printf(print, "}");
-            break;
-        }
-        case PIXFORMAT_RGB565: {
-            mp_printf(print, "{\"l_bins\":");
-            mp_obj_print_helper(print, self->LBins, kind);
-            mp_printf(print, ", \"a_bins\":");
-            mp_obj_print_helper(print, self->ABins, kind);
-            mp_printf(print, ", \"b_bins\":");
-            mp_obj_print_helper(print, self->BBins, kind);
-            mp_printf(print, "}");
-            break;
-        }
-        default: {
-            mp_printf(print, "{}");
-            break;
-        }
-    }
-}
-
-static mp_obj_t py_histogram_subscr(mp_obj_t self_in, mp_obj_t index, mp_obj_t value) {
-    if (value == MP_OBJ_SENTINEL) {
-        // load
-        py_histogram_obj_t *self = self_in;
-        if (MP_OBJ_IS_TYPE(index, &mp_type_slice)) {
-            mp_bound_slice_t slice;
-            if (!mp_seq_get_fast_slice_indexes(py_histogram_obj_size, index, &slice)) {
-                mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("only slices with step=1 (aka None) are supported"));
-            }
-            mp_obj_tuple_t *result = mp_obj_new_tuple(slice.stop - slice.start, NULL);
-            mp_seq_copy(result->items, &(self->LBins) + slice.start, result->len, mp_obj_t);
-            return result;
-        }
-        switch (mp_get_index(self->base.type, py_histogram_obj_size, index, false)) {
-            case 0: return self->LBins;
-            case 1: return self->ABins;
-            case 2: return self->BBins;
-        }
-    }
-    return MP_OBJ_NULL; // op not supported
-}
-
-mp_obj_t py_histogram_bins(mp_obj_t self_in) {
-    return ((py_histogram_obj_t *) MP_OBJ_TO_PTR(self_in))->LBins;
-}
-static MP_DEFINE_CONST_FUN_OBJ_1(py_histogram_bins_obj, py_histogram_bins);
-
-mp_obj_t py_histogram_l_bins(mp_obj_t self_in) {
-    return ((py_histogram_obj_t *) MP_OBJ_TO_PTR(self_in))->LBins;
-}
-static MP_DEFINE_CONST_FUN_OBJ_1(py_histogram_l_bins_obj, py_histogram_l_bins);
-
-mp_obj_t py_histogram_a_bins(mp_obj_t self_in) {
-    return ((py_histogram_obj_t *) MP_OBJ_TO_PTR(self_in))->ABins;
-}
-static MP_DEFINE_CONST_FUN_OBJ_1(py_histogram_a_bins_obj, py_histogram_a_bins);
-
-mp_obj_t py_histogram_b_bins(mp_obj_t self_in) {
-    return ((py_histogram_obj_t *) MP_OBJ_TO_PTR(self_in))->BBins;
-}
-static MP_DEFINE_CONST_FUN_OBJ_1(py_histogram_b_bins_obj, py_histogram_b_bins);
-
-static void py_histogram_to_hist(py_histogram_obj_t *self, histogram_t *hist) {
-    mp_obj_list_t *l_bins = MP_OBJ_TO_PTR(self->LBins);
-    mp_obj_list_t *a_bins = MP_OBJ_TO_PTR(self->ABins);
-    mp_obj_list_t *b_bins = MP_OBJ_TO_PTR(self->BBins);
-
-    hist->LBinCount = l_bins->len;
-    hist->ABinCount = a_bins->len;
-    hist->BBinCount = b_bins->len;
-    hist->LBins = uma_malloc(hist->LBinCount * sizeof(float), UMA_DTCM);
-    hist->ABins = uma_malloc(hist->ABinCount * sizeof(float), UMA_DTCM);
-    hist->BBins = uma_malloc(hist->BBinCount * sizeof(float), UMA_DTCM);
-
-    for (int i = 0; i < hist->LBinCount; i++) {
-        hist->LBins[i] = mp_obj_get_float_to_f(l_bins->items[i]);
-    }
-    for (int i = 0; i < hist->ABinCount; i++) {
-        hist->ABins[i] = mp_obj_get_float_to_f(a_bins->items[i]);
-    }
-    for (int i = 0; i < hist->BBinCount; i++) {
-        hist->BBins[i] = mp_obj_get_float_to_f(b_bins->items[i]);
-    }
-}
-
-static void py_histogram_free_hist(histogram_t *hist) {
-    uma_free(hist->BBins);
-    uma_free(hist->ABins);
-    uma_free(hist->LBins);
-}
-
-mp_obj_t py_histogram_get_percentile(mp_obj_t self_in, mp_obj_t percentile) {
-    py_histogram_obj_t *self = MP_OBJ_TO_PTR(self_in);
-    histogram_t hist;
-    py_histogram_to_hist(self, &hist);
-
-    percentile_t p;
-    imlib_get_percentile(&p, self->pixfmt, &hist, mp_obj_get_float_to_f(percentile));
-    py_histogram_free_hist(&hist);
-
-    mp_obj_t items[] = {
-        mp_obj_new_int(p.LValue),
-        mp_obj_new_int(p.LValue),
-        mp_obj_new_int(p.AValue),
-        mp_obj_new_int(p.BValue),
-    };
-    return mp_obj_new_attrtuple(percentile_fields, MP_ARRAY_SIZE(percentile_fields), items);
-}
-static MP_DEFINE_CONST_FUN_OBJ_2(py_histogram_get_percentile_obj, py_histogram_get_percentile);
-
-mp_obj_t py_histogram_get_threshold(mp_obj_t self_in) {
-    py_histogram_obj_t *self = MP_OBJ_TO_PTR(self_in);
-    histogram_t hist;
-    py_histogram_to_hist(self, &hist);
-
-    threshold_t t;
-    imlib_get_threshold(&t, self->pixfmt, &hist);
-    py_histogram_free_hist(&hist);
-
-    mp_obj_t items[] = {
-        mp_obj_new_int(t.LValue),
-        mp_obj_new_int(t.LValue),
-        mp_obj_new_int(t.AValue),
-        mp_obj_new_int(t.BValue),
-    };
-    return mp_obj_new_attrtuple(threshold_fields, MP_ARRAY_SIZE(threshold_fields), items);
-}
-static MP_DEFINE_CONST_FUN_OBJ_1(py_histogram_get_threshold_obj, py_histogram_get_threshold);
-
-mp_obj_t py_histogram_get_statistics(mp_obj_t self_in) {
-    py_histogram_obj_t *self = MP_OBJ_TO_PTR(self_in);
-    histogram_t hist;
-    py_histogram_to_hist(self, &hist);
-
-    statistics_t stats;
-    imlib_get_statistics(&stats, self->pixfmt, &hist);
-    py_histogram_free_hist(&hist);
-
-    return py_statistics_attrtuple(&stats);
-}
-static MP_DEFINE_CONST_FUN_OBJ_1(py_histogram_get_statistics_obj, py_histogram_get_statistics);
-
-static const mp_rom_map_elem_t py_histogram_locals_dict_table[] = {
-    { MP_ROM_QSTR(MP_QSTR_bins), MP_ROM_PTR(&py_histogram_bins_obj) },
-    { MP_ROM_QSTR(MP_QSTR_l_bins), MP_ROM_PTR(&py_histogram_l_bins_obj) },
-    { MP_ROM_QSTR(MP_QSTR_a_bins), MP_ROM_PTR(&py_histogram_a_bins_obj) },
-    { MP_ROM_QSTR(MP_QSTR_b_bins), MP_ROM_PTR(&py_histogram_b_bins_obj) },
-    { MP_ROM_QSTR(MP_QSTR_get_percentile), MP_ROM_PTR(&py_histogram_get_percentile_obj) },
-    { MP_ROM_QSTR(MP_QSTR_get_threshold), MP_ROM_PTR(&py_histogram_get_threshold_obj) },
-    { MP_ROM_QSTR(MP_QSTR_get_stats), MP_ROM_PTR(&py_histogram_get_statistics_obj) },
-    { MP_ROM_QSTR(MP_QSTR_get_statistics), MP_ROM_PTR(&py_histogram_get_statistics_obj) },
-    { MP_ROM_QSTR(MP_QSTR_statistics), MP_ROM_PTR(&py_histogram_get_statistics_obj) }
-};
-
-static MP_DEFINE_CONST_DICT(py_histogram_locals_dict, py_histogram_locals_dict_table);
-
-static MP_DEFINE_CONST_OBJ_TYPE(
-    py_histogram_type,
-    MP_QSTR_histogram,
-    MP_TYPE_FLAG_NONE,
-    print, py_histogram_print,
-    subscr, py_histogram_subscr,
-    locals_dict, &py_histogram_locals_dict
-    );
 
 static mp_obj_t py_image_get_histogram(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     enum { ARG_thresholds, ARG_invert, ARG_roi, ARG_bins, ARG_l_bins, ARG_a_bins, ARG_b_bins, ARG_difference };
@@ -4566,9 +4261,6 @@ mp_obj_t py_image_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw
         }
     }
 
-    if (args[ARG_copy_to_fb].u_bool) {
-        framebuffer_update_preview(&image);
-    }
     return py_image_from_struct(&image);
 }
 
@@ -5140,259 +4832,6 @@ mp_obj_t py_image_from_struct(image_t *img) {
     o->_cobj = *img;
     return o;
 }
-
-#ifdef IMLIB_ENABLE_FEATURES
-mp_obj_t py_image_load_cascade(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
-    enum { ARG_stages };
-    static const mp_arg_t allowed_args[] = {
-        { MP_QSTR_stages, MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = -1} },
-    };
-    cascade_t cascade;
-    const char *path = mp_obj_str_get_str(pos_args[0]);
-
-    // Load cascade from file or flash
-    if (imlib_load_cascade(&cascade, path) != 0) {
-        #if MICROPY_VFS
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Failed to load Haar cascade"));
-        #else
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Image I/O is not supported"));
-        #endif
-    }
-
-    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
-    mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
-    // Read the number of stages
-    int stages = (args[ARG_stages].u_int >= 0) ? args[ARG_stages].u_int : cascade.n_stages;
-    // Check the number of stages
-    if (stages > 0 && stages < cascade.n_stages) {
-        cascade.n_stages = stages;
-    }
-
-    // Return micropython cascade object
-    py_cascade_obj_t *o = m_new_obj(py_cascade_obj_t);
-    o->base.type = &py_cascade_type;
-    o->_cobj = cascade;
-    return o;
-}
-static MP_DEFINE_CONST_FUN_OBJ_KW(py_image_load_cascade_obj, 1, py_image_load_cascade);
-#endif // IMLIB_ENABLE_FEATURES
-
-#if defined(IMLIB_ENABLE_DESCRIPTOR)
-#if defined(IMLIB_ENABLE_IMAGE_FILE_IO)
-mp_obj_t py_image_load_descriptor(size_t n_args, const mp_obj_t *args, mp_map_t *kw_args) {
-    file_t fp;
-
-    uint32_t desc_type;
-    mp_obj_t desc = mp_const_none;
-    const char *path = mp_obj_str_get_str(args[0]);
-
-    file_open(&fp, path, FA_READ | FA_OPEN_EXISTING);
-
-    // Read descriptor type
-    file_read(&fp, &desc_type, sizeof(desc_type));
-
-    // Load descriptor
-    switch (desc_type) {
-        #if defined(IMLIB_ENABLE_FIND_LBP)
-        case DESC_LBP: {
-            py_lbp_obj_t *lbp = m_new_obj(py_lbp_obj_t);
-            lbp->base.type = &py_lbp_type;
-
-            imlib_lbp_desc_load(&fp, &lbp->hist);
-            desc = lbp;
-            break;
-        }
-        #endif  //IMLIB_ENABLE_FIND_LBP
-        #if defined(IMLIB_ENABLE_FIND_KEYPOINTS)
-        case DESC_ORB: {
-            array_t *kpts = NULL;
-            array_alloc(&kpts, m_free);
-
-            orb_load_descriptor(&fp, kpts);
-
-            // Return keypoints MP object
-            py_kp_obj_t *kp_obj = m_new_obj(py_kp_obj_t);
-            kp_obj->base.type = &py_kp_type;
-            kp_obj->kpts = kpts;
-            kp_obj->threshold = 10;
-            kp_obj->normalized = false;
-            desc = kp_obj;
-            break;
-        }
-        #endif //IMLIB_ENABLE_FIND_KEYPOINTS
-        default:
-            // Unsupported descriptor type
-            desc = mp_const_none;
-            break;
-    }
-
-    file_close(&fp);
-
-    // If descriptor is still none, then it's not supported.
-    if (desc == mp_const_none) {
-        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("Descriptor type is not supported"));
-    }
-    return desc;
-}
-static MP_DEFINE_CONST_FUN_OBJ_KW(py_image_load_descriptor_obj, 1, py_image_load_descriptor);
-
-mp_obj_t py_image_save_descriptor(size_t n_args, const mp_obj_t *args, mp_map_t *kw_args) {
-    file_t fp;
-
-    uint32_t desc_type;
-    const char *path = mp_obj_str_get_str(args[1]);
-
-    file_open(&fp, path, FA_WRITE | FA_CREATE_ALWAYS);
-
-    // Find descriptor type
-    const mp_obj_type_t *desc_obj_type = mp_obj_get_type(args[0]);
-    if (0) {
-    #if defined(IMLIB_ENABLE_FIND_LBP)
-    } else if (desc_obj_type == &py_lbp_type) {
-        desc_type = DESC_LBP;
-    #endif //IMLIB_ENABLE_FIND_LBP
-    #if defined(IMLIB_ENABLE_FIND_KEYPOINTS)
-    } else if (desc_obj_type == &py_kp_type) {
-        desc_type = DESC_ORB;
-    #endif //IMLIB_ENABLE_FIND_KEYPOINTS
-    } else {
-        (void) desc_obj_type;
-        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("Descriptor type is not supported"));
-    }
-
-    // Write descriptor type
-    file_write(&fp, &desc_type, sizeof(desc_type));
-
-    // Write descriptor
-    switch (desc_type) {
-        #if defined(IMLIB_ENABLE_FIND_LBP)
-        case DESC_LBP: {
-            py_lbp_obj_t *lbp = ((py_lbp_obj_t *) args[0]);
-            imlib_lbp_desc_save(&fp, lbp->hist);
-            break;
-        }
-        #endif //IMLIB_ENABLE_FIND_LBP
-        #if defined(IMLIB_ENABLE_FIND_KEYPOINTS)
-        case DESC_ORB: {
-            py_kp_obj_t *kpts = ((py_kp_obj_t *) args[0]);
-            orb_save_descriptor(&fp, kpts->kpts);
-            break;
-        }
-        #endif //IMLIB_ENABLE_FIND_KEYPOINTS
-    }
-
-    file_close(&fp);
-    return mp_const_true;
-}
-static MP_DEFINE_CONST_FUN_OBJ_KW(py_image_save_descriptor_obj, 2, py_image_save_descriptor);
-#endif //IMLIB_ENABLE_IMAGE_FILE_IO
-
-static const qstr kptmatch_fields[] = {
-    MP_QSTR_x, MP_QSTR_y, MP_QSTR_w, MP_QSTR_h, MP_QSTR_cx, MP_QSTR_cy,
-    MP_QSTR_count, MP_QSTR_theta, MP_QSTR_match, MP_QSTR_rect,
-};
-
-static mp_obj_t py_image_match_descriptor(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
-    enum { ARG_threshold, ARG_filter_outliers };
-    static const mp_arg_t allowed_args[] = {
-        { MP_QSTR_threshold,      MP_ARG_INT | MP_ARG_KW_ONLY, {.u_int = 85} },
-        { MP_QSTR_filter_outliers, MP_ARG_BOOL | MP_ARG_KW_ONLY, {.u_bool = false} },
-    };
-    mp_arg_val_t kw_vals[MP_ARRAY_SIZE(allowed_args)];
-    mp_arg_parse_all(n_args - 2, pos_args + 2, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, kw_vals);
-
-    mp_obj_t match_obj = mp_const_none;
-    const mp_obj_type_t *desc1_type = mp_obj_get_type(pos_args[0]);
-    const mp_obj_type_t *desc2_type = mp_obj_get_type(pos_args[1]);
-    PY_ASSERT_TRUE_MSG((desc1_type == desc2_type), "Descriptors have different types!");
-
-    if (0) {
-    #if defined(IMLIB_ENABLE_FIND_LBP)
-    } else if (desc1_type == &py_lbp_type) {
-        py_lbp_obj_t *lbp1 = ((py_lbp_obj_t *) pos_args[0]);
-        py_lbp_obj_t *lbp2 = ((py_lbp_obj_t *) pos_args[1]);
-
-        // Sanity checks
-        PY_ASSERT_TYPE(lbp1, &py_lbp_type);
-        PY_ASSERT_TYPE(lbp2, &py_lbp_type);
-
-        // Match descriptors
-        match_obj = mp_obj_new_int(imlib_lbp_desc_distance(lbp1->hist, lbp2->hist));
-    #endif //IMLIB_ENABLE_FIND_LBP
-    #if defined(IMLIB_ENABLE_FIND_KEYPOINTS)
-    } else if (desc1_type == &py_kp_type) {
-        py_kp_obj_t *kpts1 = ((py_kp_obj_t *) pos_args[0]);
-        py_kp_obj_t *kpts2 = ((py_kp_obj_t *) pos_args[1]);
-        int threshold = kw_vals[ARG_threshold].u_int;
-        int filter_outliers = kw_vals[ARG_filter_outliers].u_bool;
-
-        // Sanity checks
-        PY_ASSERT_TYPE(kpts1, &py_kp_type);
-        PY_ASSERT_TYPE(kpts2, &py_kp_type);
-        PY_ASSERT_TRUE_MSG((threshold >= 0 && threshold <= 100), "Expected threshold between 0 and 100");
-
-        int theta = 0;          // Estimated angle of rotation
-        int count = 0;          // Number of matches
-        point_t c = {0};        // Centroid
-        rectangle_t r = {0};    // Bounding rectangle
-        // List of matching keypoints indices
-        mp_obj_t match_list = mp_obj_new_list(0, NULL);
-
-        if (array_length(kpts1->kpts) && array_length(kpts1->kpts)) {
-            int *match = uma_malloc(array_length(kpts1->kpts) * sizeof(int) * 2, UMA_DTCM);
-
-            // Match the two keypoint sets
-            count = orb_match_keypoints(kpts1->kpts, kpts2->kpts, match, threshold, &r, &c, &theta);
-
-            // Add matching keypoints to Python list.
-            for (int i = 0; i < count * 2; i += 2) {
-                mp_obj_t index_obj[2] = {
-                    mp_obj_new_int(match[i + 0]),
-                    mp_obj_new_int(match[i + 1]),
-                };
-                mp_obj_list_append(match_list, mp_obj_new_tuple(2, index_obj));
-            }
-
-            uma_free(match);
-
-            if (filter_outliers == true) {
-                count = orb_filter_keypoints(kpts2->kpts, &r, &c);
-            }
-        }
-
-        mp_obj_t rx = mp_obj_new_int(r.x);
-        mp_obj_t ry = mp_obj_new_int(r.y);
-        mp_obj_t rw = mp_obj_new_int(r.w);
-        mp_obj_t rh = mp_obj_new_int(r.h);
-        mp_obj_t items[] = {
-            rx, ry, rw, rh,
-            mp_obj_new_int(c.x), mp_obj_new_int(c.y),
-            mp_obj_new_int(count), mp_obj_new_int(theta), match_list,
-            mp_obj_new_tuple(4, (mp_obj_t []) {rx, ry, rw, rh}),
-        };
-        match_obj = mp_obj_new_attrtuple(kptmatch_fields, MP_ARRAY_SIZE(kptmatch_fields), items);
-    #endif //IMLIB_ENABLE_FIND_KEYPOINTS
-    } else {
-        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("Descriptor type is not supported"));
-    }
-
-    return match_obj;
-}
-static MP_DEFINE_CONST_FUN_OBJ_KW(py_image_match_descriptor_obj, 2, py_image_match_descriptor);
-#endif //IMLIB_ENABLE_DESCRIPTOR
-
-#if defined(IMLIB_ENABLE_FIND_KEYPOINTS) && defined(IMLIB_ENABLE_IMAGE_FILE_IO)
-int py_image_descriptor_from_roi(image_t *img, const char *path, rectangle_t *roi) {
-    file_t fp;
-    array_t *kpts = orb_find_keypoints(img, false, 20, 1.5f, 100, CORNER_AGAST, roi);
-    if (array_length(kpts)) {
-        file_open(&fp, path, FA_WRITE | FA_CREATE_ALWAYS);
-        orb_save_descriptor(&fp, kpts);
-        file_close(&fp);
-    }
-    return 0;
-}
-#endif // IMLIB_ENABLE_KEYPOINTS && IMLIB_ENABLE_IMAGE_FILE_IO
 
 // Module-level blob geometry functions //
 

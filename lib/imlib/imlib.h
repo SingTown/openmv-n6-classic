@@ -835,7 +835,6 @@ bool image_get_mask_pixel(image_t *ptr, int x, int y);
 #define JPEG_444_YCBCR_MCU_SIZE    ((JPEG_444_GS_MCU_SIZE) * 3)
 #define JPEG_422_YCBCR_MCU_SIZE    ((JPEG_444_GS_MCU_SIZE) * 4)
 #define JPEG_420_YCBCR_MCU_SIZE    ((JPEG_444_GS_MCU_SIZE) * 6)
-#define JPEG_MAX_ALLOC_SIZE        (1024UL * 1024UL) // 1 MB
 
 typedef enum jpeg_subsampling {
     JPEG_SUBSAMPLING_AUTO = 0,
@@ -1237,7 +1236,7 @@ pixformat_t imlib_bayer_shift(pixformat_t pixfmt, int x, int y, bool transpose);
 void imlib_debayer_ycbcr(image_t *src, rectangle_t *roi, int8_t *Y0, int8_t *CB, int8_t *CR);
 void imlib_debayer_line(int x_start, int x_end, int y_row, void *dst_row_ptr, pixformat_t pixfmt, image_t *src);
 void imlib_debayer_image(image_t *dst, image_t *src);
-void imlib_debayer_image_awb(image_t *dst, image_t *src, bool fast, uint32_t r_out, uint32_t g_out, uint32_t b_out);
+void imlib_debayer_image_awb(image_t *dst, image_t *src, bool fast, float r_gain, float g_gain, float b_gain);
 
 // YUV Image Processing
 pixformat_t imlib_yuv_shift(pixformat_t pixfmt, int x);
@@ -1271,7 +1270,7 @@ void imlib_hardware_venc_deinit();
 void jpeg_get_mcu(image_t *src, int x_offset, int y_offset, int dx, int dy,
                   int8_t *Y0, int8_t *CB, int8_t *CR);
 void jpeg_decompress(image_t *dst, image_t *src);
-bool jpeg_compress(image_t *src, image_t *dst, int quality, bool realloc, jpeg_subsampling_t subsampling);
+int jpeg_compress(image_t *src, image_t *dst, int quality, jpeg_subsampling_t subsampling);
 bool jpeg_is_valid(image_t *img);
 int jpeg_clean_trailing_bytes(int bpp, uint8_t *data);
 void jpeg_read_geometry(file_t *fp, image_t *img, const char *path, jpg_read_settings_t *rs);
@@ -1279,7 +1278,7 @@ void jpeg_read_pixels(file_t *fp, image_t *img);
 void jpeg_read(image_t *img, const char *path);
 void jpeg_write(image_t *img, const char *path, int quality);
 void png_decompress(image_t *dst, image_t *src);
-bool png_compress(image_t *src, image_t *dst);
+int png_compress(image_t *src, image_t *dst);
 void png_read_geometry(file_t *fp, image_t *img, const char *path, png_read_settings_t *rs);
 void png_read_pixels(file_t *fp, image_t *img);
 void png_read(image_t *img, const char *path);

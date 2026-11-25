@@ -30,16 +30,19 @@
  *
  * CSI Python module.
  */
-#include <stdarg.h>
 #include <stdio.h>
 #include "py/mphal.h"
 #include "py/runtime.h"
+#include "shared/runtime/mpirq.h"
 
 #if MICROPY_PY_CSI_NG
 
 #include "omv_csi.h"
 #include "omv_gpio.h"
+#include "lepton.h"
+#include "himax.h"
 #include "genx320.h"
+#include "boson.h"
 
 #include "imlib.h"
 #include "py_assert.h"
@@ -67,6 +70,7 @@ typedef struct _py_csi_obj_t {
     void *raw;
     mp_obj_t vsync_cb;
     mp_obj_t frame_cb;
+    bool vsync_state;
 } py_csi_obj_t;
 
 const mp_obj_type_t py_csi_type;
@@ -805,8 +809,8 @@ static mp_obj_t py_csi_lens_correction(size_t n_args, const mp_obj_t *pos_args, 
     enum { ARG_enable, ARG_radi, ARG_coef };
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_enable, MP_ARG_BOOL | MP_ARG_REQUIRED },
-        { MP_QSTR_radi,   MP_ARG_BOOL | MP_ARG_REQUIRED },
-        { MP_QSTR_coef,   MP_ARG_BOOL | MP_ARG_REQUIRED },
+        { MP_QSTR_radi,   MP_ARG_INT | MP_ARG_REQUIRED },
+        { MP_QSTR_coef,   MP_ARG_INT | MP_ARG_REQUIRED },
     };
 
     py_csi_obj_t *self = MP_OBJ_TO_PTR(pos_args[0]);
@@ -823,15 +827,25 @@ static mp_obj_t py_csi_lens_correction(size_t n_args, const mp_obj_t *pos_args, 
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(py_csi_lens_correction_obj, 1, py_csi_lens_correction);
 
+static mp_obj_t py_csi_vsync(mp_obj_t self_in) {
+    py_csi_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    return mp_obj_new_int(self->vsync_state);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(py_csi_vsync_obj, py_csi_vsync);
+
 static void omv_csi_vsync_callback(void *data) {
     py_csi_obj_t *self = data;
 
     if (mp_obj_is_callable(self->vsync_cb)) {
-        uint32_t vsync_state = 0;
         #ifdef OMV_CSI_VSYNC_PIN
-        vsync_state = omv_gpio_read(OMV_CSI_VSYNC_PIN);
+        self->vsync_state = omv_gpio_read(OMV_CSI_VSYNC_PIN);
         #endif
-        mp_call_function_1(self->vsync_cb, mp_obj_new_int(vsync_state));
+        // Dispatch as a hard IRQ so an exception cannot propagate into the IRQ handler.
+        if (mp_irq_dispatch(self->vsync_cb, MP_OBJ_FROM_PTR(self), true) < 0) {
+            // Uncaught exception; disable the callback so that it doesn't run again.
+            self->vsync_cb = mp_const_none;
+            omv_csi_set_vsync_callback(self->csi, (omv_csi_cb_t) { NULL, NULL });
+        }
     }
 }
 
@@ -864,7 +878,12 @@ static void omv_csi_frame_callback(void *data) {
     py_csi_obj_t *self = data;
 
     if (mp_obj_is_callable(self->frame_cb)) {
-        mp_call_function_0(self->frame_cb);
+        // Dispatch as a hard IRQ so an exception cannot propagate into the IRQ handler.
+        if (mp_irq_dispatch(self->frame_cb, MP_OBJ_FROM_PTR(self), true) < 0) {
+            // Uncaught exception; disable the callback so that it doesn't run again.
+            self->frame_cb = mp_const_none;
+            omv_csi_set_frame_callback(self->csi, (omv_csi_cb_t) { NULL, NULL });
+        }
     }
 }
 
@@ -893,389 +912,346 @@ static mp_obj_t py_csi_frame_callback(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(py_csi_frame_callback_obj, 1, 2, py_csi_frame_callback);
 
+// An ioctl argument is a sequence of 4-byte slots described by a format string:
+// 'i' int, 'b' bool (out only), 'f' float, 'W' a window tuple expanded into four
+// int slots, '_' skip a slot without consuming an argument. Arguments that were
+// not passed are set to -1, so drivers can tell them from any valid value.
+// Shapes that are not a sequence of slots use a handler instead.
+typedef void (*py_csi_unpack_t) (py_csi_obj_t *self, size_t n_args,
+                                 const mp_obj_t *args, void *arg);
+typedef mp_obj_t (*py_csi_pack_t) (const void *arg);
+
+typedef struct {
+    uint16_t request;
+    uint8_t min_args;
+    uint8_t max_args;
+    const char *in;
+    const char *out;
+    py_csi_unpack_t unpack;
+    py_csi_pack_t pack;
+} py_csi_ioctl_desc_t;
+
+static omv_csi_window_t py_csi_arg_to_window(const mp_obj_t arg) {
+    omv_csi_window_t window = {0};
+    mp_obj_t *array;
+    mp_uint_t array_len;
+    mp_obj_get_array(arg, &array_len, &array);
+
+    if (array_len == 4) {
+        window.x = mp_obj_get_int(array[0]);
+        window.y = mp_obj_get_int(array[1]);
+        window.w = mp_obj_get_int(array[2]);
+        window.h = mp_obj_get_int(array[3]);
+    } else if (array_len == 2) {
+        window.w = mp_obj_get_int(array[0]);
+        window.h = mp_obj_get_int(array[1]);
+    } else {
+        mp_raise_msg(&mp_type_ValueError,
+                     MP_ERROR_TEXT("Expected (w, h) or (x, y, w, h) tuple/list."));
+    }
+
+    return window;
+}
+
+static void py_csi_unpack_fmt(size_t n_args, const mp_obj_t *args, void *arg, const char *fmt) {
+    size_t slot = 0;
+    size_t index = 0;
+
+    for (const char *f = fmt; *f; f++, slot++) {
+        switch (*f) {
+            case 'i': {
+                ((int32_t *) arg)[slot] = (index < n_args) ? mp_obj_get_int(args[index]) : -1;
+                index++;
+                break;
+            }
+            case 'f': {
+                if (index < n_args) {
+                    ((float *) arg)[slot] = mp_obj_get_float_to_f(args[index]);
+                }
+                index++;
+                break;
+            }
+            case 'W': {
+                *((omv_csi_window_t *) &((int32_t *) arg)[slot]) = py_csi_arg_to_window(args[index]);
+                // Four slots, the loop advances the fourth.
+                slot += 3;
+                index++;
+                break;
+            }
+            default: {
+                break;
+            }
+        }
+    }
+}
+
+static mp_obj_t py_csi_pack_fmt(const void *arg, const char *fmt) {
+    mp_obj_tuple_t *tuple = NULL;
+    mp_obj_t value = mp_const_none;
+    size_t count = 0;
+
+    for (const char *f = fmt; *f; f++) {
+        if (*f != '_') {
+            count++;
+        }
+    }
+
+    if (count == 0) {
+        return mp_const_none;
+    }
+
+    if (count > 1) {
+        tuple = MP_OBJ_TO_PTR(mp_obj_new_tuple(count, NULL));
+    }
+
+    size_t slot = 0;
+    size_t index = 0;
+
+    for (const char *f = fmt; *f; f++, slot++) {
+        switch (*f) {
+            case 'i': {
+                value = mp_obj_new_int(((const int32_t *) arg)[slot]);
+                break;
+            }
+            case 'b': {
+                value = mp_obj_new_bool(((const int32_t *) arg)[slot]);
+                break;
+            }
+            case 'f': {
+                value = mp_obj_new_float(((const float *) arg)[slot]);
+                break;
+            }
+            default: {
+                continue;
+            }
+        }
+
+        if (tuple != NULL) {
+            tuple->items[index++] = value;
+        }
+    }
+
+    return (tuple != NULL) ? MP_OBJ_FROM_PTR(tuple) : value;
+}
+
+static void py_csi_unpack_lepton_set_attr(py_csi_obj_t *self, size_t n_args,
+                                          const mp_obj_t *args, void *arg) {
+    lepton_ioctl_arg_t *a = arg;
+    size_t data_len;
+
+    a->attr.command = mp_obj_get_int(args[0]);
+    a->attr.data = (uint16_t *) mp_obj_str_get_data(args[1], &data_len);
+    a->attr.len = data_len / sizeof(uint16_t);
+    PY_ASSERT_TRUE_MSG(data_len > 0, "0 bytes transferred!");
+}
+
+static void py_csi_unpack_lepton_get_attr(py_csi_obj_t *self, size_t n_args,
+                                          const mp_obj_t *args, void *arg) {
+    lepton_ioctl_arg_t *a = arg;
+    int command = mp_obj_get_int(args[0]);
+    size_t data_len = mp_obj_get_int(args[1]);
+
+    PY_ASSERT_TRUE_MSG(data_len > 0, "0 bytes transferred!");
+    a->attr.command = command;
+    a->attr.data = m_malloc(data_len * sizeof(uint16_t));
+    a->attr.len = data_len;
+}
+
+static mp_obj_t py_csi_pack_lepton_attr(const void *arg) {
+    const lepton_ioctl_arg_t *a = arg;
+    return mp_obj_new_bytearray_by_ref(a->attr.len * sizeof(uint16_t), a->attr.data);
+}
+
+#if (OMV_GENX320_ENABLE == 1)
+static mp_obj_t py_csi_pack_genx320_image(const void *arg) {
+    const genx320_ioctl_arg_t *a = arg;
+    return py_image_from_struct((image_t *) &a->image);
+}
+
+static void py_csi_unpack_genx320_events(py_csi_obj_t *self, size_t n_args,
+                                         const mp_obj_t *args, void *arg) {
+    genx320_ioctl_arg_t *a = arg;
+
+    if (!MP_OBJ_IS_TYPE(args[0], &ulab_ndarray_type)) {
+        mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("Expected a ndarray with dtype uint16"));
+    }
+
+    ndarray_obj_t *array = MP_OBJ_TO_PTR(args[0]);
+
+    if (array->dtype != NDARRAY_UINT16) {
+        mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("Expected a ndarray with dtype uint16"));
+    }
+
+    uint32_t expected_len = self->csi->resolution[self->csi->framesize][0] *
+                            (self->csi->resolution[self->csi->framesize][1] / sizeof(uint32_t));
+
+    if (!(ndarray_is_dense(array) && (array->ndim == 2) &&
+          (array->shape[ULAB_MAX_DIMS - 2] == expected_len) &&
+          (array->shape[ULAB_MAX_DIMS - 1] == EC_EVENT_SIZE))) {
+        mp_raise_msg_varg(&mp_type_ValueError,
+                          MP_ERROR_TEXT("Expected a dense ndarray with shape (%d, %d)"),
+                          expected_len, EC_EVENT_SIZE);
+    }
+
+    a->events.events = array->array;
+}
+#endif // (OMV_GENX320_ENABLE == 1)
+
+static const py_csi_ioctl_desc_t py_csi_ioctl_table[] = {
+    // Common requests.
+    { OMV_CSI_IOCTL_SET_READOUT_WINDOW,    1, 1, "W",  "",     NULL, NULL },
+    { OMV_CSI_IOCTL_GET_READOUT_WINDOW,    0, 0, "",   "iiii", NULL, NULL },
+    { OMV_CSI_IOCTL_SET_TRIGGERED_MODE,    1, 1, "i",  "",     NULL, NULL },
+    { OMV_CSI_IOCTL_GET_TRIGGERED_MODE,    0, 0, "",   "b",    NULL, NULL },
+    { OMV_CSI_IOCTL_SET_FOV_WIDE,          1, 1, "i",  "",     NULL, NULL },
+    { OMV_CSI_IOCTL_GET_FOV_WIDE,          0, 0, "",   "b",    NULL, NULL },
+    { OMV_CSI_IOCTL_TRIGGER_AUTO_FOCUS,    0, 0, "",   "",     NULL, NULL },
+    { OMV_CSI_IOCTL_PAUSE_AUTO_FOCUS,      0, 0, "",   "",     NULL, NULL },
+    { OMV_CSI_IOCTL_RESET_AUTO_FOCUS,      0, 0, "",   "",     NULL, NULL },
+    { OMV_CSI_IOCTL_WAIT_ON_AUTO_FOCUS,    0, 1, "i",  "",     NULL, NULL },
+    { OMV_CSI_IOCTL_SET_NIGHT_MODE,        1, 1, "i",  "",     NULL, NULL },
+    { OMV_CSI_IOCTL_GET_NIGHT_MODE,        0, 0, "",   "b",    NULL, NULL },
+    { OMV_CSI_IOCTL_GET_RGB_STATS,         0, 0, "",   "iiii", NULL, NULL },
+    { OMV_CSI_IOCTL_SET_STROBE_MODE,       1, 1, "i",  "",     NULL, NULL },
+    { OMV_CSI_IOCTL_GET_STROBE_MODE,       0, 0, "",   "b",    NULL, NULL },
+
+    // FLIR Lepton.
+    { OMV_CSI_IOCTL_LEPTON_GET_WIDTH,      0, 0, "",   "i",    NULL, NULL },
+    { OMV_CSI_IOCTL_LEPTON_GET_HEIGHT,     0, 0, "",   "i",    NULL, NULL },
+    { OMV_CSI_IOCTL_LEPTON_GET_RADIOMETRY, 0, 0, "",   "i",    NULL, NULL },
+    { OMV_CSI_IOCTL_LEPTON_GET_REFRESH,    0, 0, "",   "i",    NULL, NULL },
+    { OMV_CSI_IOCTL_LEPTON_GET_RESOLUTION, 0, 0, "",   "i",    NULL, NULL },
+    { OMV_CSI_IOCTL_LEPTON_RUN_COMMAND,    1, 1, "i",  "",     NULL, NULL },
+    { OMV_CSI_IOCTL_LEPTON_GET_FPA_TEMP,   0, 0, "",   "f",    NULL, NULL },
+    { OMV_CSI_IOCTL_LEPTON_GET_AUX_TEMP,   0, 0, "",   "f",    NULL, NULL },
+    { OMV_CSI_IOCTL_LEPTON_SET_MODE,       1, 2, "ii", "",     NULL, NULL },
+    { OMV_CSI_IOCTL_LEPTON_GET_MODE,       0, 0, "",   "bb",   NULL, NULL },
+    { OMV_CSI_IOCTL_LEPTON_SET_RANGE,      2, 2, "ff", "",     NULL, NULL },
+    { OMV_CSI_IOCTL_LEPTON_GET_RANGE,      0, 0, "",   "ff",   NULL, NULL },
+    { OMV_CSI_IOCTL_LEPTON_SET_ATTRIBUTE,  2, 2, NULL, "",     py_csi_unpack_lepton_set_attr, NULL },
+    { OMV_CSI_IOCTL_LEPTON_GET_ATTRIBUTE,  2, 2, NULL, NULL,   py_csi_unpack_lepton_get_attr,
+      py_csi_pack_lepton_attr },
+
+    #if (OMV_HM01B0_ENABLE == 1)
+    // Himax.
+    { OMV_CSI_IOCTL_HIMAX_MD_ENABLE,       1, 1, "i",  "",     NULL, NULL },
+    { OMV_CSI_IOCTL_HIMAX_MD_CLEAR,        0, 0, "",   "",     NULL, NULL },
+    { OMV_CSI_IOCTL_HIMAX_MD_WINDOW,       1, 1, "W",  "",     NULL, NULL },
+    { OMV_CSI_IOCTL_HIMAX_MD_THRESHOLD,    1, 1, "i",  "",     NULL, NULL },
+    { OMV_CSI_IOCTL_HIMAX_OSC_ENABLE,      1, 1, "i",  "",     NULL, NULL },
+    #endif // (OMV_HM01B0_ENABLE == 1)
+
+    #if (OMV_GENX320_ENABLE == 1)
+    // Prophesee GenX320.
+    { OMV_CSI_IOCTL_GENX320_SET_BIASES,    1, 1, "i",  "",     NULL, NULL },
+    { OMV_CSI_IOCTL_GENX320_SET_BIAS,      2, 2, "ii", "",     NULL, NULL },
+    { OMV_CSI_IOCTL_GENX320_SET_AFK,       1, 3, "iii", "",    NULL, NULL },
+    { OMV_CSI_IOCTL_GENX320_SET_STC,       1, 3, "iii", "",    NULL, NULL },
+    { OMV_CSI_IOCTL_GENX320_SET_MODE,      1, 2, "ii", "",     NULL, NULL },
+    { OMV_CSI_IOCTL_GENX320_CALIBRATE,     2, 2, "if", "__i",  NULL, NULL },
+    #if MICROPY_PY_ULAB
+    { OMV_CSI_IOCTL_GENX320_READ_EVENTS,   1, 1, NULL, "_i",   py_csi_unpack_genx320_events, NULL },
+    #endif // MICROPY_PY_ULAB
+    { OMV_CSI_IOCTL_GENX320_READ_EVENTS_RAW, 0, 0, "", NULL,   NULL, py_csi_pack_genx320_image },
+    #endif // (OMV_GENX320_ENABLE == 1)
+
+    #if (OMV_BOSON_ENABLE == 1)
+    // FLIR Boson.
+    { OMV_CSI_IOCTL_BOSON_GET_SOFTWARE_REV,       0, 0, "",   "iii",      NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_GET_FPA_TEMP,           0, 0, "",   "f",        NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_SET_GAIN_MODE,          1, 1, "i",  "",         NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_GET_GAIN_MODE,          0, 0, "",   "i",        NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_RUN_FFC,                0, 0, "",   "",         NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_GET_FFC_STATUS,         0, 0, "",   "i",        NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_SET_FFC_MODE,           1, 1, "i",  "",         NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_GET_FFC_MODE,           0, 0, "",   "i",        NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_SET_FFC_TEMP_THRESHOLD, 1, 1, "i",  "",         NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_GET_FFC_TEMP_THRESHOLD, 0, 0, "",   "i",        NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_SET_FFC_FRAME_THRESHOLD, 1, 1, "i", "",         NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_GET_FFC_FRAME_THRESHOLD, 0, 0, "",  "i",        NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_SET_FFC_NUM_FRAMES,     1, 1, "i",  "",         NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_GET_FFC_NUM_FRAMES,     0, 0, "",   "i",        NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_GET_RADIOMETRY_CAPABLE, 0, 0, "",   "b",        NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_SET_TLINEAR_ENABLE,     1, 1, "i",  "",         NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_GET_TLINEAR_ENABLE,     0, 0, "",   "b",        NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_SET_TEMP_STABLE_ENABLE, 1, 1, "i",  "",         NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_GET_TEMP_STABLE_ENABLE, 0, 0, "",   "b",        NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_SET_EMISSIVITY,         1, 1, "f",  "",         NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_GET_EMISSIVITY,         0, 0, "",   "f",        NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_SET_TEMP_BACKGROUND,    1, 1, "f",  "",         NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_GET_TEMP_BACKGROUND,    0, 0, "",   "f",        NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_SET_SPOT_METER_ENABLE,  1, 1, "i",  "",         NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_GET_SPOT_METER_ENABLE,  0, 0, "",   "b",        NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_SET_SPOT_METER_ROI,     1, 1, "W",  "",         NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_GET_SPOT_METER_ROI,     0, 0, "",   "iiii",     NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_GET_SPOT_METER_ROI_MAX, 0, 0, "",   "ii",       NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_SET_SPOT_METER_MODE,    1, 1, "i",  "",         NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_GET_SPOT_METER_MODE,    0, 0, "",   "i",        NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_GET_SPOT_METER_STATS,   0, 0, "",   "iiiiiiii", NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_GET_SPOT_METER_TEMP_STATS, 0, 0, "", "fffiifii", NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_GET_TEMP_FROM_COUNTS,   2, 2, "ii", "__f",      NULL, NULL },
+    { OMV_CSI_IOCTL_BOSON_GET_RBFO,               2, 2, "ii", "__ffff",   NULL, NULL },
+    #endif // (OMV_BOSON_ENABLE == 1)
+};
+
+static const py_csi_ioctl_desc_t *py_csi_ioctl_find(int request) {
+    for (size_t i = 0; i < MP_ARRAY_SIZE(py_csi_ioctl_table); i++) {
+        if (py_csi_ioctl_table[i].request == request) {
+            return &py_csi_ioctl_table[i];
+        }
+    }
+    return NULL;
+}
+
 static mp_obj_t py_csi_ioctl(size_t n_args, const mp_obj_t *args) {
     py_csi_obj_t *self = MP_OBJ_TO_PTR(args[0]);
     int request = mp_obj_get_int(args[1]);
 
-    mp_obj_t ret_obj = mp_const_none;
-    int error = OMV_CSI_ERROR_INVALID_ARGUMENT;
+    // Sized to the widest sensor family's argument, so one stack slot serves
+    // every request. All members start at offset 0.
+    union {
+        omv_csi_ioctl_arg_t common;
+        lepton_ioctl_arg_t lepton;
+        #if (OMV_HM01B0_ENABLE == 1)
+        himax_ioctl_arg_t himax;
+        #endif
+        #if (OMV_GENX320_ENABLE == 1)
+        genx320_ioctl_arg_t genx320;
+        #endif
+        #if (OMV_BOSON_ENABLE == 1)
+        boson_ioctl_arg_t boson;
+        #endif
+    } arg = {0};
 
     // Skip self + request so ioctl args start at args[0].
     args += 2;
     n_args -= 2;
 
-    switch (request) {
-        case OMV_CSI_IOCTL_SET_READOUT_WINDOW: {
-            if (n_args == 1) {
-                int x, y, w, h;
-                mp_obj_t *array;
-                mp_uint_t array_len;
-                mp_obj_get_array(args[0], &array_len, &array);
+    const py_csi_ioctl_desc_t *desc = py_csi_ioctl_find(request);
 
-                if (array_len == 4) {
-                    x = mp_obj_get_int(array[0]);
-                    y = mp_obj_get_int(array[1]);
-                    w = mp_obj_get_int(array[2]);
-                    h = mp_obj_get_int(array[3]);
-                } else if (array_len == 2) {
-                    w = mp_obj_get_int(array[0]);
-                    h = mp_obj_get_int(array[1]);
-                    x = 0;
-                    y = 0;
-                } else {
-                    mp_raise_msg(&mp_type_ValueError,
-                                 MP_ERROR_TEXT("Expected (w, h) or (x, y, w, h) tuple/list."));
-                }
-
-                error = omv_csi_ioctl(self->csi, request, x, y, w, h);
-            }
-            break;
-        }
-
-        case OMV_CSI_IOCTL_GET_READOUT_WINDOW: {
-            int x, y, w, h;
-            error = omv_csi_ioctl(self->csi, request, &x, &y, &w, &h);
-            if (error == 0) {
-                ret_obj = mp_obj_new_tuple(4, (mp_obj_t []) {mp_obj_new_int(x),
-                                                             mp_obj_new_int(y),
-                                                             mp_obj_new_int(w),
-                                                             mp_obj_new_int(h)});
-            }
-            break;
-        }
-
-        case OMV_CSI_IOCTL_SET_TRIGGERED_MODE:
-        case OMV_CSI_IOCTL_SET_FOV_WIDE:
-        case OMV_CSI_IOCTL_SET_NIGHT_MODE: {
-            if (n_args == 1) {
-                error = omv_csi_ioctl(self->csi, request, mp_obj_get_int(args[0]));
-            }
-            break;
-        }
-
-        case OMV_CSI_IOCTL_GET_TRIGGERED_MODE:
-        case OMV_CSI_IOCTL_GET_FOV_WIDE:
-        case OMV_CSI_IOCTL_GET_NIGHT_MODE: {
-            int enabled;
-            error = omv_csi_ioctl(self->csi, request, &enabled);
-            if (error == 0) {
-                ret_obj = mp_obj_new_bool(enabled);
-            }
-            break;
-        }
-
-        #if (OMV_OV5640_AF_ENABLE == 1)
-        case OMV_CSI_IOCTL_TRIGGER_AUTO_FOCUS:
-        case OMV_CSI_IOCTL_PAUSE_AUTO_FOCUS:
-        case OMV_CSI_IOCTL_RESET_AUTO_FOCUS: {
-            error = omv_csi_ioctl(self->csi, request);
-            break;
-        }
-        case OMV_CSI_IOCTL_WAIT_ON_AUTO_FOCUS: {
-            error = omv_csi_ioctl(self->csi, request, (n_args < 1) ? 5000 : mp_obj_get_int(args[0]));
-            break;
-        }
-        #endif
-
-        case OMV_CSI_IOCTL_LEPTON_GET_WIDTH: {
-            int width;
-            error = omv_csi_ioctl(self->csi, request, &width);
-            if (error == 0) {
-                ret_obj = mp_obj_new_int(width);
-            }
-            break;
-        }
-
-        case OMV_CSI_IOCTL_LEPTON_GET_HEIGHT: {
-            int height;
-            error = omv_csi_ioctl(self->csi, request, &height);
-            if (error == 0) {
-                ret_obj = mp_obj_new_int(height);
-            }
-            break;
-        }
-
-        case OMV_CSI_IOCTL_LEPTON_GET_RADIOMETRY: {
-            int radiometry;
-            error = omv_csi_ioctl(self->csi, request, &radiometry);
-            if (error == 0) {
-                ret_obj = mp_obj_new_int(radiometry);
-            }
-            break;
-        }
-
-        case OMV_CSI_IOCTL_LEPTON_GET_REFRESH: {
-            int refresh;
-            error = omv_csi_ioctl(self->csi, request, &refresh);
-            if (error == 0) {
-                ret_obj = mp_obj_new_int(refresh);
-            }
-            break;
-        }
-
-        case OMV_CSI_IOCTL_LEPTON_GET_RESOLUTION: {
-            int resolution;
-            error = omv_csi_ioctl(self->csi, request, &resolution);
-            if (error == 0) {
-                ret_obj = mp_obj_new_int(resolution);
-            }
-            break;
-        }
-
-        case OMV_CSI_IOCTL_LEPTON_RUN_COMMAND: {
-            if (n_args == 1) {
-                error = omv_csi_ioctl(self->csi, request, mp_obj_get_int(args[0]));
-            }
-            break;
-        }
-
-        case OMV_CSI_IOCTL_LEPTON_SET_ATTRIBUTE: {
-            if (n_args == 2) {
-                size_t data_len;
-                int command = mp_obj_get_int(args[0]);
-                uint16_t *data = (uint16_t *) mp_obj_str_get_data(args[1], &data_len);
-                PY_ASSERT_TRUE_MSG(data_len > 0, "0 bytes transferred!");
-                error = omv_csi_ioctl(self->csi, request, command, data, data_len / sizeof(uint16_t));
-            }
-            break;
-        }
-
-        case OMV_CSI_IOCTL_LEPTON_GET_ATTRIBUTE: {
-            if (n_args == 2) {
-                int command = mp_obj_get_int(args[0]);
-                size_t data_len = mp_obj_get_int(args[1]);
-                PY_ASSERT_TRUE_MSG(data_len > 0, "0 bytes transferred!");
-                uint16_t *data = m_malloc(data_len * sizeof(uint16_t));
-                error = omv_csi_ioctl(self->csi, request, command, data, data_len);
-                if (error == 0) {
-                    ret_obj = mp_obj_new_bytearray_by_ref(data_len * sizeof(uint16_t), data);
-                }
-            }
-            break;
-        }
-
-        case OMV_CSI_IOCTL_LEPTON_GET_FPA_TEMP:
-        case OMV_CSI_IOCTL_LEPTON_GET_AUX_TEMP: {
-            int temp;
-            error = omv_csi_ioctl(self->csi, request, &temp);
-            if (error == 0) {
-                ret_obj = mp_obj_new_float((((float) temp) / 100) - 273.15f);
-            }
-            break;
-        }
-
-        case OMV_CSI_IOCTL_LEPTON_SET_MODE:
-            if (n_args >= 1) {
-                int high_temp = (n_args < 2) ? false : mp_obj_get_int(args[1]);
-                error = omv_csi_ioctl(self->csi, request, mp_obj_get_int(args[0]), high_temp);
-            }
-            break;
-
-        case OMV_CSI_IOCTL_LEPTON_GET_MODE: {
-            int enabled, high_temp;
-            error = omv_csi_ioctl(self->csi, request, &enabled, &high_temp);
-            if (error == 0) {
-                ret_obj = mp_obj_new_tuple(2, (mp_obj_t []) {
-                    mp_obj_new_bool(enabled), mp_obj_new_bool(high_temp)
-                });
-            }
-            break;
-        }
-
-        case OMV_CSI_IOCTL_LEPTON_SET_RANGE:
-            if (n_args == 2) {
-                // GCC will not let us pass floats to ... so we have to pass float pointers instead.
-                float min = mp_obj_get_float_to_f(args[0]);
-                float max = mp_obj_get_float_to_f(args[1]);
-                error = omv_csi_ioctl(self->csi, request, &min, &max);
-            }
-            break;
-
-        case OMV_CSI_IOCTL_LEPTON_GET_RANGE: {
-            float min, max;
-            error = omv_csi_ioctl(self->csi, request, &min, &max);
-            if (error == 0) {
-                ret_obj = mp_obj_new_tuple(2, (mp_obj_t []) {mp_obj_new_float(min), mp_obj_new_float(max)});
-            }
-            break;
-        }
-
-        #if (OMV_HM01B0_ENABLE == 1)
-        case OMV_CSI_IOCTL_HIMAX_MD_ENABLE: {
-            if (n_args == 1) {
-                error = omv_csi_ioctl(self->csi, request, mp_obj_get_int(args[0]));
-            }
-            break;
-        }
-
-        case OMV_CSI_IOCTL_HIMAX_MD_WINDOW: {
-            if (n_args == 1) {
-                int x, y, w, h;
-                mp_obj_t *array;
-                mp_uint_t array_len;
-                mp_obj_get_array(args[0], &array_len, &array);
-
-                if (array_len == 4) {
-                    x = mp_obj_get_int(array[0]);
-                    y = mp_obj_get_int(array[1]);
-                    w = mp_obj_get_int(array[2]);
-                    h = mp_obj_get_int(array[3]);
-                } else if (array_len == 2) {
-                    w = mp_obj_get_int(array[0]);
-                    h = mp_obj_get_int(array[1]);
-                    x = 0;
-                    y = 0;
-                } else {
-                    mp_raise_msg(&mp_type_ValueError,
-                                 MP_ERROR_TEXT("The tuple/list must either be (x, y, w, h) or (w, h)"));
-                }
-
-                error = omv_csi_ioctl(self->csi, request, x, y, w, h);
-            }
-            break;
-        }
-
-        case OMV_CSI_IOCTL_HIMAX_MD_THRESHOLD: {
-            if (n_args == 1) {
-                error = omv_csi_ioctl(self->csi, request, mp_obj_get_int(args[0]));
-            }
-            break;
-        }
-
-        case OMV_CSI_IOCTL_HIMAX_MD_CLEAR: {
-            error = omv_csi_ioctl(self->csi, request);
-            break;
-        }
-
-        case OMV_CSI_IOCTL_HIMAX_OSC_ENABLE: {
-            if (n_args == 1) {
-                error = omv_csi_ioctl(self->csi, request, mp_obj_get_int(args[0]));
-            }
-            break;
-        }
-        #endif // (OMV_HM01B0_ENABLE == 1)
-
-        case OMV_CSI_IOCTL_GET_RGB_STATS: {
-            uint32_t r, gb, gr, b;
-            error = omv_csi_ioctl(self->csi, request, &r, &gb, &gr, &b);
-            if (error == 0) {
-                ret_obj = mp_obj_new_tuple(4, (mp_obj_t []) {mp_obj_new_int(r),
-                                                             mp_obj_new_int(gb),
-                                                             mp_obj_new_int(gr),
-                                                             mp_obj_new_int(b)});
-            }
-            break;
-        }
-
-        #if (OMV_GENX320_ENABLE == 1)
-        case OMV_CSI_IOCTL_GENX320_SET_BIASES: {
-            if (n_args == 1) {
-                error = omv_csi_ioctl(self->csi, request, mp_obj_get_int(args[0]));
-            }
-            break;
-        }
-        case OMV_CSI_IOCTL_GENX320_SET_BIAS: {
-            if (n_args == 2) {
-                error = omv_csi_ioctl(self->csi,
-                                      request,
-                                      mp_obj_get_int(args[0]),
-                                      mp_obj_get_int(args[1]));
-            }
-            break;
-        }
-        case OMV_CSI_IOCTL_GENX320_SET_AFK: {
-            if (n_args == 1) {
-                error = omv_csi_ioctl(self->csi, request, mp_obj_get_int(args[0]));
-            } else if (n_args == 3) {
-                error = omv_csi_ioctl(self->csi,
-                                      request,
-                                      mp_obj_get_int(args[0]),
-                                      mp_obj_get_int(args[1]),
-                                      mp_obj_get_int(args[2]));
-            }
-            break;
-        }
-        case OMV_CSI_IOCTL_GENX320_SET_STC: {
-            if (n_args == 1) {
-                error = omv_csi_ioctl(self->csi, request, mp_obj_get_int(args[0]));
-            } else if (n_args == 2) {
-                error = omv_csi_ioctl(self->csi,
-                                      request,
-                                      mp_obj_get_int(args[0]),
-                                      mp_obj_get_int(args[1]));
-            } else if (n_args == 3) {
-                error = omv_csi_ioctl(self->csi,
-                                      request,
-                                      mp_obj_get_int(args[0]),
-                                      mp_obj_get_int(args[1]),
-                                      mp_obj_get_int(args[2]));
-            }
-            break;
-        }
-        case OMV_CSI_IOCTL_GENX320_SET_MODE: {
-            if (n_args == 1) {
-                error = omv_csi_ioctl(self->csi, request, mp_obj_get_int(args[0]));
-            } else if (n_args == 2) {
-                error = omv_csi_ioctl(self->csi, request, mp_obj_get_int(args[0]), mp_obj_get_int(args[1]));
-            }
-            break;
-        }
-        case OMV_CSI_IOCTL_GENX320_READ_EVENTS: {
-            if (n_args == 1 && MP_OBJ_IS_TYPE(args[0], &ulab_ndarray_type)) {
-                ndarray_obj_t *array = MP_OBJ_TO_PTR(args[0]);
-
-                if (array->dtype != NDARRAY_UINT16) {
-                    mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("Expected a ndarray with dtype uint16"));
-                }
-
-                uint32_t expected_len = self->csi->resolution[self->csi->framesize][0] *
-                                        (self->csi->resolution[self->csi->framesize][1] / sizeof(uint32_t));
-
-                if (!(ndarray_is_dense(array) && (array->ndim == 2) &&
-                      (array->shape[ULAB_MAX_DIMS - 2] == expected_len) &&
-                      (array->shape[ULAB_MAX_DIMS - 1] == EC_EVENT_SIZE))) {
-                    mp_raise_msg_varg(&mp_type_ValueError,
-                                      MP_ERROR_TEXT("Expected a dense ndarray with shape (%d, %d)"),
-                                      expected_len, EC_EVENT_SIZE);
-                }
-
-                error = omv_csi_ioctl(self->csi, request, array->array);
-                if (error > 0) {
-                    ret_obj = mp_obj_new_int(error);
-                }
-            }
-            break;
-        }
-        case OMV_CSI_IOCTL_GENX320_CALIBRATE: {
-            if (n_args == 2) {
-                error = omv_csi_ioctl(self->csi, request, mp_obj_get_int(args[0]),
-                                      mp_obj_get_float_to_d(args[1]));
-                if (error > 0) {
-                    ret_obj = mp_obj_new_int(error);
-                }
-            }
-            break;
-        }
-        case OMV_CSI_IOCTL_GENX320_READ_EVENTS_RAW: {
-            image_t img;
-            error = omv_csi_ioctl(self->csi, request, &img);
-            if (error == 0) {
-                ret_obj = py_image_from_struct(&img);
-            }
-            break;
-        }
-        #endif // (OMV_GENX320_ENABLE == 1)
-        default: {
-            omv_csi_raise_error(OMV_CSI_ERROR_CTL_UNSUPPORTED);
-            break;
-        }
+    if (desc == NULL) {
+        omv_csi_raise_error(OMV_CSI_ERROR_CTL_UNSUPPORTED);
     }
+
+    if ((n_args < desc->min_args) || (n_args > desc->max_args)) {
+        mp_raise_msg_varg(&mp_type_TypeError,
+                          MP_ERROR_TEXT("ioctl expects %d to %d argument(s)"),
+                          desc->min_args, desc->max_args);
+    }
+
+    if (desc->unpack != NULL) {
+        desc->unpack(self, n_args, args, &arg);
+    } else {
+        py_csi_unpack_fmt(n_args, args, &arg, desc->in);
+    }
+
+    int error = omv_csi_ioctl(self->csi, request, &arg);
 
     if (error < 0) {
         omv_csi_raise_error(error);
     }
 
-    return ret_obj;
+    return (desc->pack != NULL) ? desc->pack(&arg) : py_csi_pack_fmt(&arg, desc->out);
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(py_csi_ioctl_obj, 2, 5, py_csi_ioctl);
 
@@ -1370,6 +1346,7 @@ mp_obj_t py_csi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, 
     self->csi = csi;
     self->frame_cb = mp_const_none;
     self->vsync_cb = mp_const_none;
+    self->vsync_state = false;
     csi->disable_delays = !args[ARG_delays].u_bool;
     csi->disable_full_flush = !args[ARG_fflush].u_bool;
 
@@ -1463,6 +1440,7 @@ static const mp_rom_map_elem_t py_csi_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_framebuffers),        MP_ROM_PTR(&py_csi_framebuffers_obj) },
     { MP_ROM_QSTR(MP_QSTR_lens_correction),     MP_ROM_PTR(&py_csi_lens_correction_obj) },
     { MP_ROM_QSTR(MP_QSTR_special_effect),      MP_ROM_PTR(&py_csi_special_effect_obj) },
+    { MP_ROM_QSTR(MP_QSTR_vsync),               MP_ROM_PTR(&py_csi_vsync_obj) },
     { MP_ROM_QSTR(MP_QSTR_vsync_callback),      MP_ROM_PTR(&py_csi_vsync_callback_obj) },
     { MP_ROM_QSTR(MP_QSTR_frame_callback),      MP_ROM_PTR(&py_csi_frame_callback_obj) },
     { MP_ROM_QSTR(MP_QSTR_ioctl),               MP_ROM_PTR(&py_csi_ioctl_obj) },
@@ -1524,6 +1502,9 @@ static const mp_rom_map_elem_t globals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_NORMAL),          MP_ROM_INT(OMV_CSI_SDE_NORMAL) },    /* Normal/No SDE */
     { MP_ROM_QSTR(MP_QSTR_NEGATIVE),        MP_ROM_INT(OMV_CSI_SDE_NEGATIVE) },  /* Negative image */
 
+    // Custom Resolution
+    { MP_ROM_QSTR(MP_QSTR_CUSTOM),          MP_ROM_INT(OMV_CSI_FRAMESIZE_CUSTOM) },   /* WxH       */
+
     // C/SIF Resolutions
     { MP_ROM_QSTR(MP_QSTR_QCIF),            MP_ROM_INT(OMV_CSI_FRAMESIZE_QCIF) },     /* 176x144   */
     { MP_ROM_QSTR(MP_QSTR_CIF),             MP_ROM_INT(OMV_CSI_FRAMESIZE_CIF) },      /* 352x288   */
@@ -1557,6 +1538,8 @@ static const mp_rom_map_elem_t globals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_IOCTL_GET_READOUT_WINDOW),    MP_ROM_INT(OMV_CSI_IOCTL_GET_READOUT_WINDOW) },
     { MP_ROM_QSTR(MP_QSTR_IOCTL_SET_TRIGGERED_MODE),    MP_ROM_INT(OMV_CSI_IOCTL_SET_TRIGGERED_MODE) },
     { MP_ROM_QSTR(MP_QSTR_IOCTL_GET_TRIGGERED_MODE),    MP_ROM_INT(OMV_CSI_IOCTL_GET_TRIGGERED_MODE) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_SET_STROBE_MODE),       MP_ROM_INT(OMV_CSI_IOCTL_SET_STROBE_MODE) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_GET_STROBE_MODE),       MP_ROM_INT(OMV_CSI_IOCTL_GET_STROBE_MODE) },
     { MP_ROM_QSTR(MP_QSTR_IOCTL_SET_FOV_WIDE),          MP_ROM_INT(OMV_CSI_IOCTL_SET_FOV_WIDE) },
     { MP_ROM_QSTR(MP_QSTR_IOCTL_GET_FOV_WIDE),          MP_ROM_INT(OMV_CSI_IOCTL_GET_FOV_WIDE) },
     #if (OMV_OV5640_AF_ENABLE == 1)
@@ -1621,6 +1604,58 @@ static const mp_rom_map_elem_t globals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_RST_TRIGGER_FALLING),          MP_ROM_INT(EC_RST_TRIGGER_FALLING)},
     { MP_ROM_QSTR(MP_QSTR_EXT_TRIGGER_RISING),           MP_ROM_INT(EC_EXT_TRIGGER_RISING)},
     { MP_ROM_QSTR(MP_QSTR_EXT_TRIGGER_FALLING),          MP_ROM_INT(EC_EXT_TRIGGER_FALLING)},
+    #endif
+
+    #if (OMV_BOSON_ENABLE == 1)
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_GET_SOFTWARE_REV),          MP_ROM_INT(OMV_CSI_IOCTL_BOSON_GET_SOFTWARE_REV) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_GET_FPA_TEMP),              MP_ROM_INT(OMV_CSI_IOCTL_BOSON_GET_FPA_TEMP) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_SET_GAIN_MODE),             MP_ROM_INT(OMV_CSI_IOCTL_BOSON_SET_GAIN_MODE) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_GET_GAIN_MODE),             MP_ROM_INT(OMV_CSI_IOCTL_BOSON_GET_GAIN_MODE) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_RUN_FFC),                   MP_ROM_INT(OMV_CSI_IOCTL_BOSON_RUN_FFC) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_GET_FFC_STATUS),            MP_ROM_INT(OMV_CSI_IOCTL_BOSON_GET_FFC_STATUS) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_SET_FFC_MODE),              MP_ROM_INT(OMV_CSI_IOCTL_BOSON_SET_FFC_MODE) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_GET_FFC_MODE),              MP_ROM_INT(OMV_CSI_IOCTL_BOSON_GET_FFC_MODE) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_SET_FFC_TEMP_THRESHOLD),    MP_ROM_INT(OMV_CSI_IOCTL_BOSON_SET_FFC_TEMP_THRESHOLD) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_GET_FFC_TEMP_THRESHOLD),    MP_ROM_INT(OMV_CSI_IOCTL_BOSON_GET_FFC_TEMP_THRESHOLD) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_SET_FFC_FRAME_THRESHOLD),   MP_ROM_INT(OMV_CSI_IOCTL_BOSON_SET_FFC_FRAME_THRESHOLD) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_GET_FFC_FRAME_THRESHOLD),   MP_ROM_INT(OMV_CSI_IOCTL_BOSON_GET_FFC_FRAME_THRESHOLD) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_SET_FFC_NUM_FRAMES),        MP_ROM_INT(OMV_CSI_IOCTL_BOSON_SET_FFC_NUM_FRAMES) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_GET_FFC_NUM_FRAMES),        MP_ROM_INT(OMV_CSI_IOCTL_BOSON_GET_FFC_NUM_FRAMES) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_GET_RADIOMETRY_CAPABLE),    MP_ROM_INT(OMV_CSI_IOCTL_BOSON_GET_RADIOMETRY_CAPABLE) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_SET_TLINEAR_ENABLE),        MP_ROM_INT(OMV_CSI_IOCTL_BOSON_SET_TLINEAR_ENABLE) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_GET_TLINEAR_ENABLE),        MP_ROM_INT(OMV_CSI_IOCTL_BOSON_GET_TLINEAR_ENABLE) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_SET_TEMP_STABLE_ENABLE),    MP_ROM_INT(OMV_CSI_IOCTL_BOSON_SET_TEMP_STABLE_ENABLE) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_GET_TEMP_STABLE_ENABLE),    MP_ROM_INT(OMV_CSI_IOCTL_BOSON_GET_TEMP_STABLE_ENABLE) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_SET_EMISSIVITY),            MP_ROM_INT(OMV_CSI_IOCTL_BOSON_SET_EMISSIVITY) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_GET_EMISSIVITY),            MP_ROM_INT(OMV_CSI_IOCTL_BOSON_GET_EMISSIVITY) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_SET_TEMP_BACKGROUND),       MP_ROM_INT(OMV_CSI_IOCTL_BOSON_SET_TEMP_BACKGROUND) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_GET_TEMP_BACKGROUND),       MP_ROM_INT(OMV_CSI_IOCTL_BOSON_GET_TEMP_BACKGROUND) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_SET_SPOT_METER_ENABLE),     MP_ROM_INT(OMV_CSI_IOCTL_BOSON_SET_SPOT_METER_ENABLE) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_GET_SPOT_METER_ENABLE),     MP_ROM_INT(OMV_CSI_IOCTL_BOSON_GET_SPOT_METER_ENABLE) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_SET_SPOT_METER_ROI),        MP_ROM_INT(OMV_CSI_IOCTL_BOSON_SET_SPOT_METER_ROI) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_GET_SPOT_METER_ROI),        MP_ROM_INT(OMV_CSI_IOCTL_BOSON_GET_SPOT_METER_ROI) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_GET_SPOT_METER_ROI_MAX),    MP_ROM_INT(OMV_CSI_IOCTL_BOSON_GET_SPOT_METER_ROI_MAX) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_SET_SPOT_METER_MODE),       MP_ROM_INT(OMV_CSI_IOCTL_BOSON_SET_SPOT_METER_MODE) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_GET_SPOT_METER_MODE),       MP_ROM_INT(OMV_CSI_IOCTL_BOSON_GET_SPOT_METER_MODE) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_GET_SPOT_METER_STATS),      MP_ROM_INT(OMV_CSI_IOCTL_BOSON_GET_SPOT_METER_STATS) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_GET_SPOT_METER_TEMP_STATS), MP_ROM_INT(OMV_CSI_IOCTL_BOSON_GET_SPOT_METER_TEMP_STATS) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_GET_TEMP_FROM_COUNTS),      MP_ROM_INT(OMV_CSI_IOCTL_BOSON_GET_TEMP_FROM_COUNTS) },
+    { MP_ROM_QSTR(MP_QSTR_IOCTL_BOSON_GET_RBFO),                  MP_ROM_INT(OMV_CSI_IOCTL_BOSON_GET_RBFO) },
+    { MP_ROM_QSTR(MP_QSTR_BOSON_GAIN_HIGH),                       MP_ROM_INT(OMV_CSI_BOSON_GAIN_HIGH) },
+    { MP_ROM_QSTR(MP_QSTR_BOSON_GAIN_LOW),                        MP_ROM_INT(OMV_CSI_BOSON_GAIN_LOW) },
+    { MP_ROM_QSTR(MP_QSTR_BOSON_GAIN_AUTO),                       MP_ROM_INT(OMV_CSI_BOSON_GAIN_AUTO) },
+    { MP_ROM_QSTR(MP_QSTR_BOSON_FFC_MANUAL),                      MP_ROM_INT(OMV_CSI_BOSON_FFC_MANUAL) },
+    { MP_ROM_QSTR(MP_QSTR_BOSON_FFC_AUTO),                        MP_ROM_INT(OMV_CSI_BOSON_FFC_AUTO) },
+    { MP_ROM_QSTR(MP_QSTR_BOSON_FFC_EXTERNAL),                    MP_ROM_INT(OMV_CSI_BOSON_FFC_EXTERNAL) },
+    { MP_ROM_QSTR(MP_QSTR_BOSON_FFC_STATUS_NONE),                 MP_ROM_INT(OMV_CSI_BOSON_FFC_STATUS_NONE) },
+    { MP_ROM_QSTR(MP_QSTR_BOSON_FFC_STATUS_IMMINENT),             MP_ROM_INT(OMV_CSI_BOSON_FFC_STATUS_IMMINENT) },
+    { MP_ROM_QSTR(MP_QSTR_BOSON_FFC_STATUS_RUNNING),              MP_ROM_INT(OMV_CSI_BOSON_FFC_STATUS_RUNNING) },
+    { MP_ROM_QSTR(MP_QSTR_BOSON_FFC_STATUS_COMPLETE),             MP_ROM_INT(OMV_CSI_BOSON_FFC_STATUS_COMPLETE) },
+    { MP_ROM_QSTR(MP_QSTR_BOSON_RBFO_DEFAULT),                    MP_ROM_INT(OMV_CSI_BOSON_RBFO_DEFAULT) },
+    { MP_ROM_QSTR(MP_QSTR_BOSON_RBFO_FACTORY),                    MP_ROM_INT(OMV_CSI_BOSON_RBFO_FACTORY) },
+    { MP_ROM_QSTR(MP_QSTR_BOSON_SPOT_METER_CELSIUS),              MP_ROM_INT(OMV_CSI_BOSON_SPOT_METER_CELSIUS) },
+    { MP_ROM_QSTR(MP_QSTR_BOSON_SPOT_METER_FAHRENHEIT),           MP_ROM_INT(OMV_CSI_BOSON_SPOT_METER_FAHRENHEIT) },
+    { MP_ROM_QSTR(MP_QSTR_BOSON_SPOT_METER_KELVIN),               MP_ROM_INT(OMV_CSI_BOSON_SPOT_METER_KELVIN) },
     #endif
 };
 static MP_DEFINE_CONST_DICT(globals_dict, globals_dict_table);

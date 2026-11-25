@@ -20,3 +20,18 @@
 [submodule "scripts/libraries/microdot"]
 	path = scripts/libraries/microdot
 	url = https://github.com/miguelgrinberg/microdot.git
+[submodule "lib/cmsis/src/nn"]
+	path = lib/cmsis/src/nn
+	url = https://github.com/openmv/CMSIS-NN.git
+[submodule "drivers/ethosu"]
+	path = drivers/ethosu
+	url = https://github.com/openmv/ethos-u-core-driver.git
+[submodule "lib/torch/libtorch"]
+	path = lib/torch/libtorch
+	url = https://github.com/openmv/libtorch.git
+[submodule "lib/alif-dfp"]
+	path = lib/alif-dfp
+	url = https://github.com/openmv/alif_ensemble-cmsis-dfp.git
+[submodule "lib/cmsis/src/dsp"]
+	path = lib/cmsis/src/dsp
+	url = https://github.com/ARM-software/CMSIS-DSP.git

@@ -123,6 +123,32 @@ typedef struct ps5520_state {
 
 static ps5520_state_t ps5520_state = {};
 
+#ifdef OMV_CSI_HW_CCM_ENABLE
+// Color correction matrices tuned on the real ISP output, sorted warmest to coolest.
+static const omv_csi_ccm_t ps5520_ccm[] = {
+    {   // A (incandescent, ~2856K)
+        .chroma = OMV_CSI_CCM_CHROMA(84.277f, 86.103f, 36.783f),
+        .coeffs = { {  1.638f, -0.257f, -0.381f },
+                    { -0.552f,  1.811f, -0.259f },
+                    { -0.219f, -1.904f,  3.123f } },
+    },
+    {   // TL84 (fluorescent, ~4000K)
+        .chroma = OMV_CSI_CCM_CHROMA(75.837f, 98.400f, 45.678f),
+        .coeffs = { {  1.377f, -0.617f,  0.240f },
+                    { -0.284f,  1.168f,  0.116f },
+                    {  0.021f, -1.504f,  2.483f } },
+    },
+    {   // D65 (daylight, ~6504K)
+        .chroma = OMV_CSI_CCM_CHROMA(58.382f, 101.926f, 67.412f),
+        .coeffs = { {  1.339f, -0.419f,  0.080f },
+                    { -0.332f,  1.636f, -0.304f },
+                    { -0.055f, -0.922f,  1.977f } },
+    },
+};
+
+static const omv_csi_ccm_table_t ps5520_ccm_table = { OMV_ARRAY_SIZE(ps5520_ccm), ps5520_ccm };
+#endif // OMV_CSI_HW_CCM_ENABLE
+
 static const uint8_t sw_reset_regs[][2] = {
     { 0xEF, 0x05 },
     { 0x0F, 0x00 },
@@ -172,7 +198,6 @@ static const uint8_t stream_off_regs[][2] = {
 
 // These per-resolution register tables are only used without the ISP scaler;
 // with the scaler the sensor runs at full resolution and the ISP scales down.
-#ifndef OMV_CSI_HW_SCALE_ENABLE
 static const uint8_t res_640x480_regs[][2] = {
     // PS5520_640x480x30fps_24MHz_2Lane_RAW10_840Mbps_20190408_C10A.asc
     { 0xEF, 0x05 },
@@ -955,7 +980,6 @@ static const uint8_t res_2560x1440_regs[][2] = {
     { 0xFF, 0x02 }, // Delay 2 ms
     { 0x00, 0x00 }, // End
 };
-#endif // OMV_CSI_HW_SCALE_ENABLE
 
 static const uint8_t res_2592x1944_regs[][2] = {
     // PS5520_2592x1944x30fps_24MHz_2Lane_RAW10_840Mbps_20190408_C10A.asc
@@ -1260,15 +1284,28 @@ static int write_registers(omv_csi_t *csi, const uint8_t(*regs)[2]) {
     return ret;
 }
 
+static int set_framesize(omv_csi_t *csi, omv_csi_framesize_t framesize);
+
 static int set_pixformat(omv_csi_t *csi, pixformat_t pixformat) {
     switch (pixformat) {
         case PIXFORMAT_RGB565:
         case PIXFORMAT_BAYER:
         case PIXFORMAT_GRAYSCALE:
-            return 0;
+            break;
         default:
             return -1;
     }
+
+    #ifdef OMV_CSI_HW_SCALE_ENABLE
+    // BAYER can't be ISP-scaled, so re-select the sensor mode when toggling it.
+    if ((pixformat == PIXFORMAT_BAYER || csi->pixformat == PIXFORMAT_BAYER) &&
+        csi->framesize != OMV_CSI_FRAMESIZE_INVALID) {
+        csi->pixformat = pixformat;  // set_framesize() reads it; the caller sets it after
+        return set_framesize(csi, csi->framesize);
+    }
+    #endif
+
+    return 0;
 }
 
 static int set_framesize(omv_csi_t *csi, omv_csi_framesize_t framesize) {
@@ -1280,7 +1317,21 @@ static int set_framesize(omv_csi_t *csi, omv_csi_framesize_t framesize) {
     }
 
     int ret = 0;
-    #ifndef OMV_CSI_HW_SCALE_ENABLE
+
+    #ifdef OMV_CSI_HW_SCALE_ENABLE
+    // BAYER can't be ISP-scaled, so it runs at a native mode; other formats run
+    // at full resolution and the ISP scales down.
+    if (csi->pixformat != PIXFORMAT_BAYER) {
+        csi->src_w = SENSOR_WIDTH;
+        csi->src_h = SENSOR_HEIGHT;
+        ret |= write_registers(csi, sw_reset_regs);
+        ret |= write_registers(csi, res_2592x1944_regs);
+        return ret;
+    }
+    csi->src_w = w;
+    csi->src_h = h;
+    #endif // OMV_CSI_HW_SCALE_ENABLE
+
     const uint8_t(*regs)[2];
 
     switch (framesize) {
@@ -1311,7 +1362,6 @@ static int set_framesize(omv_csi_t *csi, omv_csi_framesize_t framesize) {
 
     // Set resolution
     ret |= write_registers(csi, regs);
-    #endif // OMV_CSI_HW_SCALE_ENABLE
     return ret;
 }
 
@@ -1499,21 +1549,6 @@ static int get_exposure_us(omv_csi_t *csi, int *exposure_us) {
     *exposure_us = ConvertL2T(exposure_line, ps5520->g_div);
 
     return ret;
-}
-
-static int set_auto_whitebal(omv_csi_t *csi, int enable, float r_gain_db, float g_gain_db, float b_gain_db) {
-    csi->stats_enabled = enable;
-    return 0;
-}
-
-static int get_rgb_gain_db(omv_csi_t *csi, float *r_gain_db, float *g_gain_db, float *b_gain_db) {
-    uint32_t r, g, b;
-    omv_csi_get_stats(csi, &r, &g, &b);
-
-    *r_gain_db = 20.0f * log10f(IM_DIV((float) g, r));
-    *g_gain_db = 0.0f;
-    *b_gain_db = 20.0f * log10f(IM_DIV((float) g, b));
-    return 0;
 }
 
 static int set_hmirror(omv_csi_t *csi, int enable) {
@@ -1743,12 +1778,13 @@ static int update_agc_aec(omv_csi_t *csi, int luminance) {
     return ret;
 }
 
-static int ioctl(omv_csi_t *csi, int request, va_list ap) {
+static int ioctl(omv_csi_t *csi, int request, void *arg) {
+    omv_csi_ioctl_arg_t *a = arg;
     int ret = 0;
 
     switch (request) {
         case OMV_CSI_IOCTL_UPDATE_AGC_AEC:
-            ret = update_agc_aec(csi, va_arg(ap, int));
+            ret = update_agc_aec(csi, a->ivalue);
             break;
         default:
             ret = -1;
@@ -1786,8 +1822,8 @@ int ps5520_init(omv_csi_t *csi) {
     csi->get_gain_db = get_gain_db;
     csi->set_auto_exposure = set_auto_exposure;
     csi->get_exposure_us = get_exposure_us;
-    csi->set_auto_whitebal = set_auto_whitebal;
-    csi->get_rgb_gain_db = get_rgb_gain_db;
+    csi->set_auto_whitebal = omv_csi_stats_set_auto_whitebal;
+    csi->get_rgb_gain_db = omv_csi_stats_get_rgb_gain_db;
     csi->set_hmirror = set_hmirror;
     csi->set_vflip = set_vflip;
 
@@ -1796,6 +1832,10 @@ int ps5520_init(omv_csi_t *csi) {
     csi->src_w = SENSOR_WIDTH;
     csi->src_h = SENSOR_HEIGHT;
     #endif // OMV_CSI_HW_SCALE_ENABLE
+
+    #ifdef OMV_CSI_HW_CCM_ENABLE
+    csi->ccm = &ps5520_ccm_table;
+    #endif // OMV_CSI_HW_CCM_ENABLE
 
     return 0;
 }

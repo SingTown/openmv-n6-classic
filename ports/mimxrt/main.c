@@ -43,6 +43,7 @@
 #include "modmimxrt.h"
 
 #include "py_fir.h"
+#include "py_protocol.h"
 
 #if MICROPY_PY_LWIP
 #include "lwip/init.h"
@@ -98,6 +99,9 @@ soft_reset:
     mp_init();
 
     // Initialise low-level sub-systems.
+    #if MICROPY_PY_PROTOCOL
+    py_protocol_init0();
+    #endif // MICROPY_PY_PROTOCOL
     #if MICROPY_PY_FIR
     py_fir_init0();
     #endif // MICROPY_PY_FIR
@@ -171,9 +175,11 @@ soft_reset:
     // Initialize OpenMV protocol
     omv_protocol_init_default();
 
-    // Run boot.py every reset and main.py on first soft-reset
-    if (pyexec_file_if_exists("boot.py") && first_soft_reset) {
+    // Run boot.py every reset and main.py on first soft-reset, followed by a soft-reset.
+    if (pyexec_file_if_exists("boot.py") && first_soft_reset &&
+        mp_import_stat("main.py") == MP_IMPORT_STAT_FILE) {
         pyexec_file_if_exists("main.py");
+        goto soft_reset_exit;
     }
 
     while (!omv_protocol_exec_script()) {
@@ -196,7 +202,7 @@ soft_reset:
         }
     }
 
-    // soft reset
+soft_reset_exit:
     mp_hal_set_interrupt_char(-1);
     mp_printf(MP_PYTHON_PRINTER, "MPY: soft reboot\n");
     omv_protocol_deinit();

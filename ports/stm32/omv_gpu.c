@@ -31,7 +31,7 @@
 #include "py/runtime.h"
 
 #include "imlib.h"
-#include "dma.h"
+#include "omv_memory.h"
 
 #if OMV_GPU_NEMA
 #include "nema_core.h"
@@ -208,7 +208,9 @@ int omv_gpu_draw_image(image_t *src_img,
                        image_hint_t hint,
                        float *transform) {
     // DMA2D can only draw on RGB565 buffers and the destination/source buffers must be accessible by DMA.
-    if ((dst_img->pixfmt != PIXFORMAT_RGB565) || (!DMA_BUFFER(dst_img->data)) || (!DMA_BUFFER(src_img->data))) {
+    if ((dst_img->pixfmt != PIXFORMAT_RGB565) ||
+        (!omv_memory_is_dmable(DMA2D, dst_img->data, image_size(dst_img))) ||
+        (!omv_memory_is_dmable(DMA2D, src_img->data, image_size(src_img)))) {
         return -1;
     }
 

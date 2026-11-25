@@ -188,7 +188,7 @@ static int py_channel_write(const omv_protocol_channel_t *channel, uint32_t offs
         return mp_obj_get_int(result);
     }
 
-    return 0; // Default success
+    return size; // Default success
 }
 
 // Readp delegate - calls Python readp method and returns pointer (dangerous but needed)
@@ -431,6 +431,17 @@ static mp_obj_t py_protocol_register(size_t n_args, const mp_obj_t *pos_args, mp
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(py_protocol_register_obj, 0, py_protocol_register);
 
+static mp_obj_t py_protocol_poll(void) {
+    return mp_obj_new_int(omv_protocol_poll());
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(py_protocol_poll_obj, py_protocol_poll);
+
+void py_protocol_init0() {
+    // Clear root pointers after a soft-reset, otherwise the GC scans channels
+    // from the previous run and retains blocks that have since been recycled.
+    memset(MP_STATE_PORT(protocol_channels), 0, sizeof(MP_STATE_PORT(protocol_channels)));
+}
+
 // Module globals table
 static const mp_rom_map_elem_t protocol_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_protocol) },
@@ -439,6 +450,7 @@ static const mp_rom_map_elem_t protocol_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&py_protocol_init_obj) },
     { MP_ROM_QSTR(MP_QSTR_is_active), MP_ROM_PTR(&py_protocol_is_active_obj) },
     { MP_ROM_QSTR(MP_QSTR_register), MP_ROM_PTR(&py_protocol_register_obj) },
+    { MP_ROM_QSTR(MP_QSTR_poll), MP_ROM_PTR(&py_protocol_poll_obj) },
 
     // Channel flags constants
     { MP_ROM_QSTR(MP_QSTR_CHANNEL_FLAG_READ), MP_ROM_INT(OMV_PROTOCOL_CHANNEL_FLAG_READ) },
@@ -466,6 +478,6 @@ const mp_obj_module_t protocol_module = {
 MP_REGISTER_EXTENSIBLE_MODULE(MP_QSTR_protocol, protocol_module);
 
 // Register root pointers for dynamic protocol channels.
-MP_REGISTER_ROOT_POINTER(mp_obj_t protocol_channels[OMV_PROTOCOL_MAX_CHANNELS]);
+MP_REGISTER_ROOT_POINTER(mp_obj_t protocol_channels[OMV_PROTOCOL_CHANNEL_MAX]);
 
 #endif // MICROPY_PY_PROTOCOL

@@ -39,6 +39,7 @@
 #include <stdio.h>
 
 #include "omv_i2c.h"
+#include "omv_gpio.h"
 #include "omv_csi.h"
 #include "py/mphal.h"
 
@@ -99,6 +100,12 @@
 #define SENSOR_TRIGGER_MODE_0       (0x02)
 #define SENSOR_TRIGGER_MODE_1       (0x03)
 #define SENSOR_SOFTWARE_TRIGGER     (0x00EA)
+#define SENSOR_FRAME_COUNT          (0x03E5)
+#define SENSOR_GPIO0                (0x0077)
+#define SENSOR_GPIO0_OUTPUT         (0xC2)
+#define SENSOR_GPIO0_INPUT          (0x02)
+#define SENSOR_GPIO0_SEL            (0x0082)
+#define SENSOR_GPIO0_SEL_LED        (0x01)
 #define ISP_EN_H                    (0x0800)
 #define ISP_EN_H_EN                 (0x01)
 #define ISP_TEST_MODE               (0x0801)
@@ -175,28 +182,32 @@
 #define PAG7936_EXPOSURE_M(exp)     (((exp) >> 8) & 0xff)
 #define PAG7936_EXPOSURE_L(exp)     ((exp) & 0xff)
 
-#if OMV_PAG7936_MIPI_CSI2
-#define PAG7936_WIDTH_ALIGN         (8)
-#define PAG7936_QVGA_FPS_MAX        (470)
-#define PAG7936_VGA_FPS_MAX         (240)
-#define PAG7936_HD_FPS_MAX          (120)
-#else
-#define PAG7936_WIDTH_ALIGN         (4)
-#define PAG7936_QVGA_FPS_MAX        (240)
-#define PAG7936_VGA_FPS_MAX         (120)
-#define PAG7936_HD_FPS_MAX          (60)
-#endif
+// The sensor's I2C address selects the output interface.
+#define PAG7936_MIPI_QVGA_FPS_MAX       (470)
+#define PAG7936_MIPI_VGA_FPS_MAX        (240)
+#define PAG7936_MIPI_HD_FPS_MAX         (120)
+#define PAG7936_MIPI_BRATE              (800)
+
+#define PAG7936_PARALLEL_QVGA_FPS_MAX   (240)
+#define PAG7936_PARALLEL_VGA_FPS_MAX    (120)
+#define PAG7936_PARALLEL_HD_FPS_MAX     (60)
+
+#define PAG7936_RESET_DELAY_MS          (20)
 
 typedef struct {
     bool gain_auto;
     bool expo_auto;
     int framerate;
+    const uint16_t(*if_regs)[2];
+    uint16_t qvga_fps_max;
+    uint16_t vga_fps_max;
+    uint16_t hd_fps_max;
 } pag7936_state_t;
 
 static pag7936_state_t pag7936_state = {};
 
-static const uint16_t default_regs[][2] = {
-    #if OMV_PAG7936_MIPI_CSI2
+// MIPI CSI-2 interface registers.
+static const uint16_t mipi_regs[][2] = {
     { 0x004C,   0x8D },
     { 0x004D,   0x20 },
     { 0x004E,   0x00 },
@@ -254,7 +265,11 @@ static const uint16_t default_regs[][2] = {
     { 0x0A34,   0x0D },
     { 0x0A35,   0x0D },
     { 0x000B,   0x01 },
-    #else
+    { 0x0000,   0x00 },
+};
+
+// Parallel interface registers.
+static const uint16_t parallel_regs[][2] = {
     { 0x010C,   0x23 },
     { 0x010D,   0x05 },
     { 0x007B,   0x8C },
@@ -340,7 +355,11 @@ static const uint16_t default_regs[][2] = {
     { 0x0A34,   0x0D },
     { 0x0A35,   0x0D },
     { 0x000B,   0x02 },
-    #endif
+    { 0x0000,   0x00 },
+};
+
+// Registers common to both interfaces.
+static const uint16_t default_regs[][2] = {
     { 0x1400,   0x01 }, // AE auto mode (bit4=0), bit0 preserved at default
     { 0x140C,   0x00 },
     { 0x140D,   0x01 }, // AE_MAXGAIN = 256 (16x, hardware max)
@@ -458,6 +477,32 @@ static const uint16_t vga_regs[][2] = {
     { 0x0000,               0x00 },
 };
 
+#ifdef OMV_CSI_HW_CCM_ENABLE
+// Color correction matrices tuned on the real ISP output, sorted warmest to coolest.
+static const omv_csi_ccm_t pag7936_ccm[] = {
+    {   // A (incandescent, ~2856K)
+        .chroma = OMV_CSI_CCM_CHROMA(70.198f, 74.512f, 28.216f),
+        .coeffs = { {  1.463f, -0.205f, -0.258f },
+                    { -0.647f,  1.983f, -0.337f },
+                    { -0.171f, -1.247f,  2.418f } },
+    },
+    {   // TL84 (fluorescent, ~4000K)
+        .chroma = OMV_CSI_CCM_CHROMA(61.160f, 79.113f, 32.965f),
+        .coeffs = { {  1.121f, -0.039f, -0.082f },
+                    { -0.427f,  1.596f, -0.169f },
+                    { -0.026f, -0.815f,  1.842f } },
+    },
+    {   // D65 (daylight, ~6504K)
+        .chroma = OMV_CSI_CCM_CHROMA(43.995f, 81.509f, 51.532f),
+        .coeffs = { {  1.324f, -0.300f, -0.024f },
+                    { -0.286f,  1.712f, -0.426f },
+                    {  0.005f, -0.734f,  1.729f } },
+    },
+};
+
+static const omv_csi_ccm_table_t pag7936_ccm_table = { OMV_ARRAY_SIZE(pag7936_ccm), pag7936_ccm };
+#endif // OMV_CSI_HW_CCM_ENABLE
+
 static const uint16_t hd_regs[][2] = {
     { TG_MONO_SENSOR,       0x00 },
     { AVERAGE_MODE,         0x00 },
@@ -491,25 +536,27 @@ static const uint16_t hd_regs[][2] = {
 };
 
 // Apply AE/AG hardware mode based on current manual/auto state.
-// gain: register value to write (already clamped), or -1 to freeze from sensor readback.
-// expo: exposure in sensor line units (already clamped), or -1 to freeze from sensor readback.
+// gain: register value to write (already clamped), or -1 to leave the gain alone.
+// expo: exposure in sensor line units (already clamped), or -1 to leave the exposure alone.
 static int ae_apply(omv_csi_t *csi, int gain, int expo) {
     pag7936_state_t *state = csi->priv;
     uint8_t reg;
     uint8_t tmp;
     int ret = omv_i2c_read_reg(csi->i2c, csi->slv_addr, AE_EXPO_MANUAL, 2, &reg, 1);
+    // AE readback lags a frame, so only seed manual registers on the switch to manual mode.
+    bool seed = !(reg & AE_EXPO_MANUAL_AE_MANUAL_EN);
 
     if (state->gain_auto && state->expo_auto) {
         ret |= omv_i2c_write_reg(csi->i2c, csi->slv_addr, AE_EXPO_MANUAL, 2, reg & ~AE_EXPO_MANUAL_AE_MANUAL_EN, 1);
     } else {
-        if (gain < 0) {
+        if (gain < 0 && seed) {
             uint8_t gainh, gainl;
             ret |= omv_i2c_read_reg(csi->i2c, csi->slv_addr, TOTAL_GAIN_10_8, 2, &gainh, 1);
             ret |= omv_i2c_read_reg(csi->i2c, csi->slv_addr, TOTAL_GAIN_7_0, 2, &gainl, 1);
             gain = PAG7936_GAIN(gainh, gainl);
         }
 
-        if (expo < 0) {
+        if (expo < 0 && seed) {
             uint8_t exph, expm, expl;
             ret |= omv_i2c_read_reg(csi->i2c, csi->slv_addr, AE_EXP_LINE_NUM_17_16, 2, &exph, 1);
             ret |= omv_i2c_read_reg(csi->i2c, csi->slv_addr, AE_EXP_LINE_NUM_15_8, 2, &expm, 1);
@@ -517,14 +564,18 @@ static int ae_apply(omv_csi_t *csi, int gain, int expo) {
             expo = PAG7936_EXPOSURE(exph, expm, expl) / PAG7936_EXP_DIV;
         }
 
-        ret |= omv_i2c_read_reg(csi->i2c, csi->slv_addr, AE_GAIN_MANUAL_10_8, 2, &tmp, 1);
-        ret |= omv_i2c_write_reg(csi->i2c, csi->slv_addr, AE_GAIN_MANUAL_10_8, 2, PAG7936_GAIN_H(tmp, gain), 1);
-        ret |= omv_i2c_write_reg(csi->i2c, csi->slv_addr, AE_GAIN_MANUAL_7_0, 2, PAG7936_GAIN_L(gain), 1);
+        if (gain >= 0) {
+            ret |= omv_i2c_read_reg(csi->i2c, csi->slv_addr, AE_GAIN_MANUAL_10_8, 2, &tmp, 1);
+            ret |= omv_i2c_write_reg(csi->i2c, csi->slv_addr, AE_GAIN_MANUAL_10_8, 2, PAG7936_GAIN_H(tmp, gain), 1);
+            ret |= omv_i2c_write_reg(csi->i2c, csi->slv_addr, AE_GAIN_MANUAL_7_0, 2, PAG7936_GAIN_L(gain), 1);
+        }
 
-        ret |= omv_i2c_read_reg(csi->i2c, csi->slv_addr, AE_EXPO_MANUAL_17_16, 2, &tmp, 1);
-        ret |= omv_i2c_write_reg(csi->i2c, csi->slv_addr, AE_EXPO_MANUAL_17_16, 2, PAG7936_EXPOSURE_H(tmp, expo), 1);
-        ret |= omv_i2c_write_reg(csi->i2c, csi->slv_addr, AE_EXPO_MANUAL_15_8, 2, PAG7936_EXPOSURE_M(expo), 1);
-        ret |= omv_i2c_write_reg(csi->i2c, csi->slv_addr, AE_EXPO_MANUAL_7_0, 2, PAG7936_EXPOSURE_L(expo), 1);
+        if (expo >= 0) {
+            ret |= omv_i2c_read_reg(csi->i2c, csi->slv_addr, AE_EXPO_MANUAL_17_16, 2, &tmp, 1);
+            ret |= omv_i2c_write_reg(csi->i2c, csi->slv_addr, AE_EXPO_MANUAL_17_16, 2, PAG7936_EXPOSURE_H(tmp, expo), 1);
+            ret |= omv_i2c_write_reg(csi->i2c, csi->slv_addr, AE_EXPO_MANUAL_15_8, 2, PAG7936_EXPOSURE_M(expo), 1);
+            ret |= omv_i2c_write_reg(csi->i2c, csi->slv_addr, AE_EXPO_MANUAL_7_0, 2, PAG7936_EXPOSURE_L(expo), 1);
+        }
 
         ret |= omv_i2c_write_reg(csi->i2c, csi->slv_addr, AE_EXPO_MANUAL, 2, reg | AE_EXPO_MANUAL_AE_MANUAL_EN, 1);
     }
@@ -538,8 +589,20 @@ static int reset(omv_csi_t *csi) {
     pag7936_state_t *state = csi->priv;
     state->gain_auto = true;
     state->expo_auto = true;
-    state->framerate = PAG7936_HD_FPS_MAX;
+    state->framerate = state->hd_fps_max;
     csi->gainceiling = OMV_CSI_GAINCEILING_16X;
+
+    // The sensor needs at least 20ms after RSTN is released before its first
+    // I2C command. Writes that land earlier are ACKed but not all applied.
+    uint32_t ticks_diff = mp_hal_ticks_ms() - csi->reset_time_ms;
+    if (ticks_diff < PAG7936_RESET_DELAY_MS) {
+        mp_hal_delay_ms(PAG7936_RESET_DELAY_MS - ticks_diff);
+    }
+
+    // Write interface registers
+    for (int i = 0; state->if_regs[i][0] && ret == 0; i++) {
+        ret |= omv_i2c_write_reg(csi->i2c, csi->slv_addr, state->if_regs[i][0], 2, state->if_regs[i][1], 1);
+    }
     // Write default registers
     for (int i = 0; default_regs[i][0] && ret == 0; i++) {
         ret |= omv_i2c_write_reg(csi->i2c, csi->slv_addr, default_regs[i][0], 2, default_regs[i][1], 1);
@@ -547,10 +610,53 @@ static int reset(omv_csi_t *csi) {
     return ret;
 }
 
+// Commands the sensor to suspend and waits until it has. The command only takes effect
+// when the in-flight frame ends, and settings that need the suspend state are ignored
+// if they are written before that.
+static int suspend(omv_csi_t *csi) {
+    pag7936_state_t *state = csi->priv;
+    mp_uint_t frame_ms = (state->framerate > 0) ? ((1000 / state->framerate) + 1) : 50;
+
+    uint8_t last = 0;
+    int ret = omv_i2c_read_reg(csi->i2c, csi->slv_addr, SENSOR_FRAME_COUNT, 2, &last, 1);
+    ret |= omv_i2c_write_reg(csi->i2c, csi->slv_addr, SENSOR_OPMODE, 2, SENSOR_OPMODE_SUSPEND, 1);
+
+    // The frame counter reads zero once the sensor has suspended. It also wraps through
+    // zero while running, so a zero that follows 255 only counts after it has held for
+    // a frame. Give up after the delay the datasheet asks for (one frame), doubled.
+    mp_uint_t start = mp_hal_ticks_ms();
+    mp_uint_t nonzero_ms = start;
+
+    while (ret == 0) {
+        mp_uint_t now = mp_hal_ticks_ms();
+        if ((now - start) >= (2 * frame_ms)) {
+            break;
+        }
+
+        uint8_t count = 0;
+        ret |= omv_i2c_read_reg(csi->i2c, csi->slv_addr, SENSOR_FRAME_COUNT, 2, &count, 1);
+
+        if (count != 0) {
+            last = count;
+            nonzero_ms = now;
+        } else if ((last != 0x00 && last != 0xFF) || (now - nonzero_ms) >= frame_ms) {
+            break;
+        }
+
+        mp_hal_delay_ms(1);
+    }
+
+    return ret;
+}
+
 static int sleep(omv_csi_t *csi, int enable) {
     int ret = omv_i2c_write_reg(csi->i2c, csi->slv_addr, SENSOR_TG_EN, 2, SENSOR_TG_EN_FLAG, 1);
-    ret |= omv_i2c_write_reg(csi->i2c, csi->slv_addr, SENSOR_OPMODE, 2,
-                             enable ? SENSOR_OPMODE_SUSPEND : SENSOR_OPMODE_RUN, 1);
+    if (enable) {
+        // Don't return until the sensor has stopped, the caller may stop its clock next.
+        ret |= suspend(csi);
+    } else {
+        ret |= omv_i2c_write_reg(csi->i2c, csi->slv_addr, SENSOR_OPMODE, 2, SENSOR_OPMODE_RUN, 1);
+    }
     return ret;
 }
 
@@ -574,15 +680,29 @@ static int read_reg_seq(omv_csi_t *csi, uint16_t addr, size_t size, uint8_t *buf
     return ret;
 }
 
+static int configure(omv_csi_t *csi, omv_csi_framesize_t target, int framerate);
+
 static int set_pixformat(omv_csi_t *csi, pixformat_t pixformat) {
     switch (pixformat) {
         case PIXFORMAT_RGB565:
         case PIXFORMAT_BAYER:
         case PIXFORMAT_GRAYSCALE:
-            return 0;
+            break;
         default:
             return -1;
     }
+
+    #ifdef OMV_CSI_HW_SCALE_ENABLE
+    // BAYER can't be ISP-scaled, so re-select the sensor mode when toggling it.
+    if ((pixformat == PIXFORMAT_BAYER || csi->pixformat == PIXFORMAT_BAYER) &&
+        csi->framesize != OMV_CSI_FRAMESIZE_INVALID) {
+        pag7936_state_t *state = csi->priv;
+        csi->pixformat = pixformat;  // configure() reads it; the caller sets it after
+        return configure(csi, csi->framesize, state->framerate);
+    }
+    #endif
+
+    return 0;
 }
 
 // Pick the largest native sensor mode that meets the requested framerate.
@@ -591,18 +711,25 @@ static omv_csi_framesize_t get_framesize(omv_csi_t *csi, omv_csi_framesize_t tar
     return target;
     #endif
 
+    // The ISP scaler cannot rescale raw BAYER, so the sensor must produce the
+    // requested size directly. QVGA/VGA/HD are all native sensor modes.
+    if (csi->pixformat == PIXFORMAT_BAYER) {
+        return target;
+    }
+
+    pag7936_state_t *state = csi->priv;
     uint32_t w = csi->resolution[target][0];
     uint32_t h = csi->resolution[target][1];
 
     if (w > csi->resolution[OMV_CSI_FRAMESIZE_VGA][0] ||
         h > csi->resolution[OMV_CSI_FRAMESIZE_VGA][1] ||
-        framerate <= PAG7936_HD_FPS_MAX) {
+        framerate <= state->hd_fps_max) {
         return OMV_CSI_FRAMESIZE_HD;
     }
 
     if (w > csi->resolution[OMV_CSI_FRAMESIZE_QVGA][0] ||
         h > csi->resolution[OMV_CSI_FRAMESIZE_QVGA][1] ||
-        framerate <= PAG7936_VGA_FPS_MAX) {
+        framerate <= state->vga_fps_max) {
         return OMV_CSI_FRAMESIZE_VGA;
     }
 
@@ -619,15 +746,15 @@ static int configure(omv_csi_t *csi, omv_csi_framesize_t target, int framerate) 
     switch (framesize) {
         case OMV_CSI_FRAMESIZE_HD:
             regs = hd_regs;
-            framerate = IM_MIN(framerate, PAG7936_HD_FPS_MAX);
+            framerate = IM_MIN(framerate, state->hd_fps_max);
             break;
         case OMV_CSI_FRAMESIZE_VGA:
             regs = vga_regs;
-            framerate = IM_MIN(framerate, PAG7936_VGA_FPS_MAX);
+            framerate = IM_MIN(framerate, state->vga_fps_max);
             break;
         case OMV_CSI_FRAMESIZE_QVGA:
             regs = qvga_regs;
-            framerate = IM_MIN(framerate, PAG7936_QVGA_FPS_MAX);
+            framerate = IM_MIN(framerate, state->qvga_fps_max);
             break;
         default:
             return -1;
@@ -803,21 +930,6 @@ static int get_exposure_us(omv_csi_t *csi, int *exposure_us) {
     return ret;
 }
 
-static int set_auto_whitebal(omv_csi_t *csi, int enable, float r_gain_db, float g_gain_db, float b_gain_db) {
-    csi->stats_enabled = enable;
-    return 0;
-}
-
-static int get_rgb_gain_db(omv_csi_t *csi, float *r_gain_db, float *g_gain_db, float *b_gain_db) {
-    uint32_t r, g, b;
-    omv_csi_get_stats(csi, &r, &g, &b);
-
-    *r_gain_db = 20.0f * log10f(IM_DIV((float) g, r));
-    *g_gain_db = 0.0f;
-    *b_gain_db = 20.0f * log10f(IM_DIV((float) g, b));
-    return 0;
-}
-
 static int set_hmirror(omv_csi_t *csi, int enable) {
     uint8_t reg;
     int ret = omv_i2c_read_reg(csi->i2c, csi->slv_addr, TG_FLIP, 2, &reg, 1);
@@ -834,8 +946,9 @@ static int set_vflip(omv_csi_t *csi, int enable) {
     return ret;
 }
 
-static int ioctl(omv_csi_t *csi, int request, va_list ap) {
+static int ioctl(omv_csi_t *csi, int request, void *arg) {
     int ret = 0;
+    omv_csi_ioctl_arg_t *a = arg;
 
     (void) read_reg_seq;
 
@@ -846,15 +959,15 @@ static int ioctl(omv_csi_t *csi, int request, va_list ap) {
             ret |= omv_i2c_write(csi->i2c, csi->slv_addr, buf, 2, OMV_I2C_XFER_NO_STOP);
             ret |= omv_i2c_read(csi->i2c, csi->slv_addr, (uint8_t *) rgb_stats, sizeof(rgb_stats), 0);
 
-            *va_arg(ap, uint32_t *) = rgb_stats[1];
-            *va_arg(ap, uint32_t *) = rgb_stats[2];
-            *va_arg(ap, uint32_t *) = rgb_stats[0];
-            *va_arg(ap, uint32_t *) = rgb_stats[3];
+            a->rgb_stats.r = rgb_stats[1];
+            a->rgb_stats.gb = rgb_stats[2];
+            a->rgb_stats.gr = rgb_stats[0];
+            a->rgb_stats.b = rgb_stats[3];
             break;
         }
         case OMV_CSI_IOCTL_SET_TRIGGERED_MODE: {
-            int enable = va_arg(ap, int);
-            ret |= omv_i2c_write_reg(csi->i2c, csi->slv_addr, SENSOR_OPMODE, 2, SENSOR_OPMODE_SUSPEND, 1);
+            int enable = a->ivalue;
+            ret |= suspend(csi);
 
             if (enable) {
                 ret |= omv_i2c_write_reg(csi->i2c, csi->slv_addr, SENSOR_TG_EN, 2, 0, 1);
@@ -877,11 +990,38 @@ static int ioctl(omv_csi_t *csi, int request, va_list ap) {
             break;
         }
         case OMV_CSI_IOCTL_GET_TRIGGERED_MODE: {
-            int *enable = va_arg(ap, int *);
             uint8_t reg;
             ret |= omv_i2c_read_reg(csi->i2c, csi->slv_addr, SENSOR_TG_EN, 2, &reg, 1);
             if (ret >= 0) {
-                *enable = (reg & SENSOR_TG_EN_FLAG) ? 0 : 1;
+                a->ivalue = (reg & SENSOR_TG_EN_FLAG) ? 0 : 1;
+            }
+            break;
+        }
+        case OMV_CSI_IOCTL_SET_STROBE_MODE: {
+            int enable = a->ivalue;
+
+            if (enable) {
+                // Stop driving the trigger pin, the sensor outputs its strobe on it.
+                if (csi->fsync_pin) {
+                    omv_gpio_config(csi->fsync_pin, OMV_GPIO_MODE_INPUT, OMV_GPIO_PULL_NONE, OMV_GPIO_SPEED_LOW, -1);
+                }
+                ret |= omv_i2c_write_reg(csi->i2c, csi->slv_addr, SENSOR_GPIO0, 2, SENSOR_GPIO0_OUTPUT, 1);
+                ret |= omv_i2c_write_reg(csi->i2c, csi->slv_addr, SENSOR_GPIO0_SEL, 2, SENSOR_GPIO0_SEL_LED, 1);
+            } else {
+                ret |= omv_i2c_write_reg(csi->i2c, csi->slv_addr, SENSOR_GPIO0_SEL, 2, 0, 1);
+                ret |= omv_i2c_write_reg(csi->i2c, csi->slv_addr, SENSOR_GPIO0, 2, SENSOR_GPIO0_INPUT, 1);
+                if (csi->fsync_pin) {
+                    omv_gpio_config(csi->fsync_pin, OMV_GPIO_MODE_OUTPUT, OMV_GPIO_PULL_NONE, OMV_GPIO_SPEED_LOW, -1);
+                    omv_gpio_write(csi->fsync_pin, 0);
+                }
+            }
+            break;
+        }
+        case OMV_CSI_IOCTL_GET_STROBE_MODE: {
+            uint8_t reg;
+            ret |= omv_i2c_read_reg(csi->i2c, csi->slv_addr, SENSOR_GPIO0_SEL, 2, &reg, 1);
+            if (ret >= 0) {
+                a->ivalue = (reg & SENSOR_GPIO0_SEL_LED) ? 1 : 0;
             }
             break;
         }
@@ -896,6 +1036,22 @@ static int ioctl(omv_csi_t *csi, int request, va_list ap) {
 
 int pag7936_init(omv_csi_t *csi) {
     csi->priv = &pag7936_state;
+
+    // The sensor's I2C address selects the output interface.
+    if (csi->slv_addr == PAG7936_SLV_ADDR_MIPI) {
+        pag7936_state.if_regs = mipi_regs;
+        pag7936_state.qvga_fps_max = PAG7936_MIPI_QVGA_FPS_MAX;
+        pag7936_state.vga_fps_max = PAG7936_MIPI_VGA_FPS_MAX;
+        pag7936_state.hd_fps_max = PAG7936_MIPI_HD_FPS_MAX;
+        csi->mipi_if = 1;
+        csi->mipi_brate = PAG7936_MIPI_BRATE;
+    } else {
+        pag7936_state.if_regs = parallel_regs;
+        pag7936_state.qvga_fps_max = PAG7936_PARALLEL_QVGA_FPS_MAX;
+        pag7936_state.vga_fps_max = PAG7936_PARALLEL_VGA_FPS_MAX;
+        pag7936_state.hd_fps_max = PAG7936_PARALLEL_HD_FPS_MAX;
+    }
+
     // Initialize csi flags.
     csi->vsync_pol = 0;
     csi->hsync_pol = 0;
@@ -903,10 +1059,7 @@ int pag7936_init(omv_csi_t *csi) {
     csi->mono_bpp = 1;
     csi->raw_output = 1;
     csi->cfa_format = SUBFORMAT_ID_BGGR;
-    #if OMV_PAG7936_MIPI_CSI2
-    csi->mipi_if = 1;
-    csi->mipi_brate = 800;
-    #endif
+    csi->halt_req = 1;
 
     // Initialize csi ops.
     csi->reset = reset;
@@ -923,8 +1076,8 @@ int pag7936_init(omv_csi_t *csi) {
     csi->get_gain_db = get_gain_db;
     csi->set_auto_exposure = set_auto_exposure;
     csi->get_exposure_us = get_exposure_us;
-    csi->set_auto_whitebal = set_auto_whitebal;
-    csi->get_rgb_gain_db = get_rgb_gain_db;
+    csi->set_auto_whitebal = omv_csi_stats_set_auto_whitebal;
+    csi->get_rgb_gain_db = omv_csi_stats_get_rgb_gain_db;
     csi->set_hmirror = set_hmirror;
     csi->set_vflip = set_vflip;
 
@@ -937,6 +1090,21 @@ int pag7936_init(omv_csi_t *csi) {
 
     csi->resolution[OMV_CSI_FRAMESIZE_QVGA][0] = 320;
     csi->resolution[OMV_CSI_FRAMESIZE_QVGA][1] = 200;
+
+    #ifdef OMV_CSI_HW_CCM_ENABLE
+    csi->ccm = &pag7936_ccm_table;
+    #endif // OMV_CSI_HW_CCM_ENABLE
+
+    #ifdef OMV_CSI_HW_BLC_ENABLE
+    // The dark floor is ~0 at 2x gain and below, and grows to ~3 counts at 16x.
+    // It differs between boards (sensor setup, lens), so boards can override it.
+    #ifdef OMV_PAG7936_BLC_SLOPE
+    csi->blc_slope = OMV_PAG7936_BLC_SLOPE;
+    #else
+    csi->blc_slope = 0.3f;
+    #endif
+    #endif // OMV_CSI_HW_BLC_ENABLE
+
     return 0;
 }
 #endif // (OMV_PAG7936_ENABLE == 1)

@@ -32,6 +32,7 @@
  * This file provides default functions that can be overriden by ports.
  */
 #if MICROPY_PY_CSI
+#include <math.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -44,6 +45,7 @@
 #include "framebuffer.h"
 #include "memcpy.h"
 #include "sensor_config.h"
+#include "simd.h"
 
 #ifndef OMV_CSI_RESET_DELAY
 #define OMV_CSI_RESET_DELAY (10)
@@ -67,6 +69,38 @@
 
 #ifndef OMV_CSI_STATS_TAU_MS
 #define OMV_CSI_STATS_TAU_MS    (250)
+#endif
+
+// RGB average that maps to a gain of 1.
+#define OMV_CSI_STATS_NEUTRAL   (128.0f)
+
+// Range of the white balance gains that can be applied.
+#ifndef OMV_CSI_STATS_GAIN_MIN
+#define OMV_CSI_STATS_GAIN_MIN  (1.0f / 128.0f)
+#endif
+
+#ifndef OMV_CSI_STATS_GAIN_MAX
+#define OMV_CSI_STATS_GAIN_MAX  (128.0f)
+#endif
+
+// Pixels with any channel at or above this are clipped, so their color is unknown.
+#ifndef OMV_CSI_STATS_CLIP
+#define OMV_CSI_STATS_CLIP          (245)
+#endif
+
+// Pixels with any channel below this are too noisy, or were clamped by the CCM, so their color is unknown.
+#ifndef OMV_CSI_STATS_DARK
+#define OMV_CSI_STATS_DARK          (16)
+#endif
+
+// Pixels sampled from each image, at most ~65k so the 32-bit AWB sums can't overflow.
+#ifndef OMV_CSI_STATS_SAMPLES
+#define OMV_CSI_STATS_SAMPLES       (16384)
+#endif
+
+// Fraction of the sampled pixels that must be usable to update the averages.
+#ifndef OMV_CSI_STATS_MIN_USABLE
+#define OMV_CSI_STATS_MIN_USABLE    (0.1f)
 #endif
 
 #ifndef __weak
@@ -328,6 +362,10 @@ __weak int omv_csi_reset(omv_csi_t *csi, bool hard) {
     // Enable collecting RGB stats.
     csi->stats_enabled = true;
     memset(&csi->stats, 0, sizeof(omv_csi_stats_t));
+    // Start out neutral until the first update.
+    csi->stats.r_avg = OMV_CSI_STATS_NEUTRAL;
+    csi->stats.g_avg = OMV_CSI_STATS_NEUTRAL;
+    csi->stats.b_avg = OMV_CSI_STATS_NEUTRAL;
     #endif // defined(OMV_CSI_STATS_ENABLE)
 
     // Restore shutdown state on reset.
@@ -336,6 +374,12 @@ __weak int omv_csi_reset(omv_csi_t *csi, bool hard) {
     }
 
     if (hard) {
+        // Stop the sensor's activity cleanly.
+        if (csi->power_on && csi->halt_req) {
+            omv_csi_sleep(csi, true);
+            mp_hal_delay_ms(10);
+        }
+
         // Disable the bus before reset.
         omv_i2c_enable(csi->i2c, false);
 
@@ -459,9 +503,10 @@ static size_t omv_csi_detect(omv_i2c_t *i2c, i2c_dev_t *dev_list) {
             #endif // (OMV_FROGEYE2020_ENABLE == 1)
 
             #if (OMV_PAG7920_ENABLE == 1) || (OMV_PAG7936_ENABLE == 1)
-            // PAG720 and PAG7936 share the same I2C address.
-            case PAG7920_SLV_ADDR:
-            case PAG7936_SLV_ADDR_ALT:
+            // PAG7920 and PAG7936 share the same I2C address.
+            // case PAG7920_SLV_ADDR:
+            case PAG7936_SLV_ADDR:
+            case PAG7936_SLV_ADDR_MIPI:
                 omv_i2c_read_reg(i2c, slv_addr, PIXART_CHIP_ID, 2, &chip_id, 2);
                 chip_id = ((chip_id << 8) | (chip_id >> 8)) & 0xFFFF;
                 break;
@@ -709,6 +754,12 @@ __weak int omv_csi_shutdown(omv_csi_t *csi, int enable) {
     // Disable any ongoing frame capture.
     omv_csi_abort(csi, true, false);
 
+    // Stop the sensor's activity cleanly.
+    if (enable && csi->power_on && csi->halt_req) {
+        omv_csi_sleep(csi, true);
+        mp_hal_delay_ms(10);
+    }
+
     #if defined(OMV_CSI_POWER_PIN)
     if (enable) {
         if (csi->power_pol == OMV_CSI_ACTIVE_HIGH) {
@@ -822,7 +873,7 @@ __weak int omv_csi_set_pixformat(omv_csi_t *csi, pixformat_t pixformat) {
 }
 
 __weak int omv_csi_set_framesize(omv_csi_t *csi, omv_csi_framesize_t framesize) {
-    if (csi->framesize == framesize) {
+    if (csi->framesize == framesize && framesize != OMV_CSI_FRAMESIZE_CUSTOM) {
         // No change
         return 0;
     }
@@ -1156,45 +1207,297 @@ __weak int omv_csi_get_rgb_gain_db(omv_csi_t *csi, float *r_gain_db, float *g_ga
 }
 
 #if defined(OMV_CSI_STATS_ENABLE)
-void omv_csi_stats_update(omv_csi_t *csi, uint32_t *r, uint32_t *g, uint32_t *b, uint32_t ms) {
-    omv_csi_stats_t *stats = &csi->stats;
-
+static void omv_csi_stats_filter(omv_csi_stats_t *stats, float r, float g, float b, uint32_t ms) {
     if (!stats->initialized) {
         stats->initialized = true;
         stats->last_ms = ms;
-        stats->r_avg = *r;
-        stats->g_avg = *g;
-        stats->b_avg = *b;
+        stats->r_avg = r;
+        stats->g_avg = g;
+        stats->b_avg = b;
     } else {
-        // Freeze the EMA when raw R/G/B ratios collapse above 2/3rds — that means
-        // saturated pixels are pinning all channels equal, which would bias AWB
+        uint32_t dt_ms = ms - stats->last_ms;
+        // Continuous-time EMA gain for elapsed dt: alpha = 1 - exp(-dt / tau)
+        float alpha = IM_CLAMP(1.0f - expf(-((float) dt_ms) / OMV_CSI_STATS_TAU_MS), 0.0f, 1.0f);
+        stats->last_ms = ms;
+        stats->r_avg += alpha * (r - stats->r_avg);
+        stats->g_avg += alpha * (g - stats->g_avg);
+        stats->b_avg += alpha * (b - stats->b_avg);
+    }
+}
+
+void omv_csi_stats_update(omv_csi_t *csi, uint32_t *r, uint32_t *g, uint32_t *b, uint32_t ms) {
+    omv_csi_stats_t *stats = &csi->stats;
+
+    if (stats->initialized) {
+        // Freeze the EMA when raw R/G/B ratios collapse above 2/3rds, which means
+        // saturated pixels are pinning all channels equal. That would bias AWB
         // toward "no correction" and tint unsaturated regions green. AEC still
         // sees live luminance and drops exposure to resolve the saturation.
         uint32_t min = IM_MIN(*r, IM_MIN(*g, *b));
         uint32_t max = IM_MAX(*r, IM_MAX(*g, *b));
 
         if (min * 3 > max * 2) {
+            // Keep the time base current, so that the EMA eases back instead of jumping when it resumes.
+            stats->last_ms = ms;
             return;
         }
-
-        uint32_t dt_ms = ms - stats->last_ms;
-        // Continuous-time EMA gain for elapsed dt: alpha = 1 - exp(-dt/τ)
-        float alpha = IM_CLAMP(1.0f - expf(-((float) dt_ms) / OMV_CSI_STATS_TAU_MS), 0.0f, 1.0f);
-        stats->last_ms = ms;
-        stats->r_avg += alpha * (*r - stats->r_avg);
-        stats->g_avg += alpha * (*g - stats->g_avg);
-        stats->b_avg += alpha * (*b - stats->b_avg);
     }
+
+    omv_csi_stats_filter(stats, *r, *g, *b, ms);
 }
 
-void omv_csi_get_stats(omv_csi_t *csi, uint32_t *r, uint32_t *g, uint32_t *b) {
+#if defined(OMV_CSI_STATS_IMAGE_ENABLE)
+static bool omv_csi_stats_invert(const float m[3][3], float inv[3][3]) {
+    float c00 = m[1][1] * m[2][2] - m[1][2] * m[2][1];
+    float c01 = m[1][2] * m[2][0] - m[1][0] * m[2][2];
+    float c02 = m[1][0] * m[2][1] - m[1][1] * m[2][0];
+    float det = m[0][0] * c00 + m[0][1] * c01 + m[0][2] * c02;
+
+    if (fabsf(det) < 1e-6f) {
+        return false;
+    }
+
+    float d = 1.0f / det;
+    inv[0][0] = c00 * d;
+    inv[0][1] = (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * d;
+    inv[0][2] = (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * d;
+    inv[1][0] = c01 * d;
+    inv[1][1] = (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * d;
+    inv[1][2] = (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * d;
+    inv[2][0] = c02 * d;
+    inv[2][1] = (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * d;
+    inv[2][2] = (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * d;
+    return true;
+}
+
+bool omv_csi_stats_update_image(omv_csi_t *csi, const image_t *image, uint32_t ms) {
+    omv_csi_stats_t *stats = &csi->stats;
+    const omv_csi_stats_xform_t *xform = &csi->stats_xform;
+
+    if (image->pixfmt != PIXFORMAT_RGB565 || image->data == NULL || image->w == 0 || image->h == 0) {
+        return false;
+    }
+
+    // Undo the CCM and then the gains in one matrix: sensor = a * (pixel - offsets).
+    float a[3][3] = { { 1.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, { 0.0f, 0.0f, 1.0f } };
+    float offsets[3] = { 0.0f, 0.0f, 0.0f };
+
+    if (xform->ccm_valid) {
+        if (!omv_csi_stats_invert(xform->ccm, a)) {
+            return false;
+        }
+        memcpy(offsets, xform->offsets, sizeof(offsets));
+    }
+
+    float bias[3];
+    for (int r = 0; r < 3; r++) {
+        float gain = OMV_MAX(xform->gains[r], 1e-3f);
+        for (int c = 0; c < 3; c++) {
+            a[r][c] /= gain;
+        }
+        bias[r] = a[r][0] * offsets[0] + a[r][1] * offsets[1] + a[r][2] * offsets[2];
+    }
+
+    // Gamma scales each pixel by (Y_in / 255)^(1 / gamma - 1), where Y_in is its luminance before gamma.
+    // That keeps its color ratios, and is undone by scaling it by (Y / 255)^(gamma - 1) of its luminance after.
+    // The weights are 8-bit fixed point, so the sums stay integers.
+    uint16_t linear[256];
+    for (int i = 0; i < 256; i++) {
+        linear[i] = xform->gamma == 1.0f ? 256 : fast_roundf(256.0f * powf(i / 255.0f, xform->gamma - 1.0f));
+    }
+
+    // Pixels are sampled on a grid spread evenly over the image.
+    int step = 1;
+    while ((image->w / step) * (image->h / step) > OMV_CSI_STATS_SAMPLES) {
+        step++;
+    }
+
+    // Each weighted channel is at most 255 * 256, so the sums can't overflow for the samples taken.
+    uint32_t sum[3] = { 0, 0, 0 };
+    uint32_t total = 0;
+    int32_t usable = 0;
+    int n = (image->w - step / 2 + step - 1) / step;
+
+    // The gathered columns are the same for every vector, so only the base moves.
+    v128_t columns = vmla_n_u16(vidup_u16(0, 1), step, vdup_u16(step / 2));
+
+    for (int y = step / 2; y < image->h; y += step) {
+        const uint16_t *row = IMAGE_COMPUTE_RGB565_PIXEL_ROW_PTR(image, y);
+        total += n;
+
+        for (int i = 0; i < n; i += UINT16_VECTOR_SIZE) {
+            v128_predicate_t pred = vpredicate_16(n - i);
+            vrgb_pixels_t pixels = vrgb_rgb565_to_pixels888(vldr_u16_gather_pred(row + i * step, columns, pred));
+
+            // The conversion leaves the neighboring pixel's bits above each 8-bit channel.
+            v128_t r = vand_u32(pixels.r, vdup_u16(0xFF));
+            v128_t g = vand_u32(pixels.g, vdup_u16(0xFF));
+            v128_t b = vand_u32(pixels.b, vdup_u16(0xFF));
+
+            // A pixel clipped or too dark in any channel has an unknown color, so its weight is zeroed.
+            // The inactive lanes are zero, so they're too dark.
+            v128_t min = vmin_u16(vmin_u16(r, g), b);
+            v128_t max = vmax_u16(vmax_u16(r, g), b);
+            v128_t mask = vand_u32(vcmp_ge_n_u16(min, OMV_CSI_STATS_DARK), vcmp_lt_n_u16(max, OMV_CSI_STATS_CLIP));
+
+            v128_t luma = vand_u32(vrgb_pixels_to_grayscale((vrgb_pixels_t) { r, g, b }), vdup_u16(0xFF));
+            v128_t w = vand_u32(vldr_u16_gather_pred(linear, luma, pred), mask);
+
+            sum[0] = vmladava_u16(r, w, sum[0]);
+            sum[1] = vmladava_u16(g, w, sum[1]);
+            sum[2] = vmladava_u16(b, w, sum[2]);
+            usable = vaddva_s16(mask, usable);
+        }
+    }
+
+    // The usable lanes of the mask are -1, so the sum is the negated count.
+    usable = -usable;
+
+    // Hold the averages when most of the image is clipped or dark, keeping the time base current.
+    if (usable == 0 || usable < total * OMV_CSI_STATS_MIN_USABLE) {
+        stats->last_ms = ms;
+        return false;
+    }
+
+    // The undo is linear, so it's applied once to the mean instead of to every pixel.
+    float mean[3];
+    for (int i = 0; i < 3; i++) {
+        mean[i] = (a[i][0] * sum[0] + a[i][1] * sum[1] + a[i][2] * sum[2]) / (usable * 256.0f) - bias[i];
+    }
+
+    omv_csi_stats_filter(stats, OMV_MAX(mean[0], 1.0f), OMV_MAX(mean[1], 1.0f), OMV_MAX(mean[2], 1.0f), ms);
+    return true;
+}
+#endif // defined(OMV_CSI_STATS_IMAGE_ENABLE)
+
+void omv_csi_stats_get(omv_csi_t *csi, float *r, float *g, float *b) {
     omv_csi_stats_t *stats = &csi->stats;
 
-    *r = fast_roundf(stats->r_avg);
-    *g = fast_roundf(stats->g_avg);
-    *b = fast_roundf(stats->b_avg);
+    // Keep the averages usable as divisors.
+    *r = OMV_MAX(stats->r_avg, 1.0f);
+    *g = OMV_MAX(stats->g_avg, 1.0f);
+    *b = OMV_MAX(stats->b_avg, 1.0f);
+}
+
+void omv_csi_stats_get_gains(omv_csi_t *csi, float *r_gain, float *g_gain, float *b_gain) {
+    float r, g, b;
+    omv_csi_stats_get(csi, &r, &g, &b);
+
+    // Normalize to the largest channel so that no gain is below 1 and clipped pixels stay white.
+    float ref = OMV_MAX(OMV_MAX(r, g), b);
+
+    // Manual gains are applied as set.
+    if (csi->stats.manual) {
+        ref = OMV_CSI_STATS_NEUTRAL;
+    }
+
+    *r_gain = IM_CLAMP(ref / r, OMV_CSI_STATS_GAIN_MIN, OMV_CSI_STATS_GAIN_MAX);
+    *g_gain = IM_CLAMP(ref / g, OMV_CSI_STATS_GAIN_MIN, OMV_CSI_STATS_GAIN_MAX);
+    *b_gain = IM_CLAMP(ref / b, OMV_CSI_STATS_GAIN_MIN, OMV_CSI_STATS_GAIN_MAX);
+}
+
+static float omv_csi_stats_gain_db_to_avg(float gain_db) {
+    // The gains are derived from the RGB averages, so store their inverse.
+    float gain = expf((gain_db / 20.0f) * M_LN10);
+    return OMV_CSI_STATS_NEUTRAL / IM_CLAMP(gain, OMV_CSI_STATS_GAIN_MIN, OMV_CSI_STATS_GAIN_MAX);
+}
+
+int omv_csi_stats_set_auto_whitebal(omv_csi_t *csi, int enable,
+                                    float r_gain_db, float g_gain_db, float b_gain_db) {
+    omv_csi_stats_t *stats = &csi->stats;
+
+    csi->stats_enabled = enable;
+
+    if (enable) {
+        if (stats->manual) {
+            // The averages were set from manual gains, so restart them from the next update.
+            stats->manual = false;
+            stats->initialized = false;
+        }
+    } else if ((!isnanf(r_gain_db)) && (!isnanf(g_gain_db)) && (!isnanf(b_gain_db))
+               && (!isinff(r_gain_db)) && (!isinff(g_gain_db)) && (!isinff(b_gain_db))) {
+        stats->manual = true;
+        stats->initialized = true;
+        stats->r_avg = omv_csi_stats_gain_db_to_avg(r_gain_db);
+        stats->g_avg = omv_csi_stats_gain_db_to_avg(g_gain_db);
+        stats->b_avg = omv_csi_stats_gain_db_to_avg(b_gain_db);
+    }
+
+    return 0;
+}
+
+int omv_csi_stats_get_rgb_gain_db(omv_csi_t *csi, float *r_gain_db, float *g_gain_db, float *b_gain_db) {
+    float r_gain, g_gain, b_gain;
+    omv_csi_stats_get_gains(csi, &r_gain, &g_gain, &b_gain);
+
+    *r_gain_db = 20.0f * log10f(r_gain);
+    *g_gain_db = 20.0f * log10f(g_gain);
+    *b_gain_db = 20.0f * log10f(b_gain);
+    return 0;
 }
 #endif // defined(OMV_CSI_STATS_ENABLE)
+
+// Frame luminance below/above which the CCM fades toward unity.
+#define OMV_CSI_CCM_DARK_UNITY      (8.0f)
+#define OMV_CSI_CCM_DARK_FULL       (32.0f)
+#define OMV_CSI_CCM_BRIGHT_FULL     (150.0f)
+#define OMV_CSI_CCM_BRIGHT_UNITY    (220.0f)
+
+// Projects the illuminant onto the polyline of calibration illuminants in log
+// chromaticity space and blends the CCMs at the ends of the closest segment (~linear in mired).
+bool omv_csi_ccm_compute(const omv_csi_ccm_table_t *table, const float rgb[3], float luminance, omv_csi_ccm_t *out) {
+    if (table == NULL || table->count == 0) {
+        return false;
+    }
+
+    const omv_csi_ccm_t *ccm = table->entries;
+    float g = OMV_MAX(rgb[1], 1.0f);
+    out->chroma[0] = logf(OMV_MAX(rgb[0], 1.0f) / g);
+    out->chroma[1] = logf(OMV_MAX(rgb[2], 1.0f) / g);
+
+    size_t idx = 0;
+    float t = 0.0f;
+    float best = INFINITY;
+
+    for (size_t i = 0; i + 1 < table->count; i++) {
+        const float *p0 = ccm[i].chroma;
+        const float *p1 = ccm[i + 1].chroma;
+
+        float dx = p1[0] - p0[0];
+        float dy = p1[1] - p0[1];
+        float len = OMV_MAX(dx * dx + dy * dy, 1e-6f);
+        float u = IM_CLAMP(((out->chroma[0] - p0[0]) * dx + (out->chroma[1] - p0[1]) * dy) / len, 0.0f, 1.0f);
+
+        float ex = p0[0] + u * dx - out->chroma[0];
+        float ey = p0[1] + u * dy - out->chroma[1];
+        float dist = ex * ex + ey * ey;
+
+        if (dist < best) {
+            best = dist;
+            idx = i;
+            t = u;
+        }
+    }
+
+    const omv_csi_ccm_t *a = &ccm[idx];
+    const omv_csi_ccm_t *b = &ccm[OMV_MIN(idx + 1, table->count - 1)];
+
+    // Very dark or bright frames fade to unity to limit noise gain and color shifts near clipping.
+    float dark = (luminance - OMV_CSI_CCM_DARK_UNITY) / (OMV_CSI_CCM_DARK_FULL - OMV_CSI_CCM_DARK_UNITY);
+    float bright = (OMV_CSI_CCM_BRIGHT_UNITY - luminance) / (OMV_CSI_CCM_BRIGHT_UNITY - OMV_CSI_CCM_BRIGHT_FULL);
+    float strength = IM_CLAMP(OMV_MIN(dark, bright), 0.0f, 1.0f);
+
+    for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 3; c++) {
+            float v = a->coeffs[r][c] + t * (b->coeffs[r][c] - a->coeffs[r][c]);
+            out->coeffs[r][c] = strength * v + (1.0f - strength) * (r == c);
+        }
+
+        out->offsets[r] = strength * (a->offsets[r] + t * (b->offsets[r] - a->offsets[r]));
+    }
+
+    return true;
+}
 
 __weak int omv_csi_set_auto_blc(omv_csi_t *csi, int enable, int *regs) {
     // Check if the control is supported.
@@ -1407,9 +1710,9 @@ __weak int omv_csi_set_lens_correction(omv_csi_t *csi, int enable, int radi, int
     return 0;
 }
 
-__weak int omv_csi_ioctl(omv_csi_t *csi, int request, ... /* arg */) {
+__weak int omv_csi_ioctl(omv_csi_t *csi, int request, void *arg) {
     // Disable any ongoing frame capture.
-    if (request & OMV_CSI_FLAG_IOCTL_ABORT) {
+    if (request & OMV_CSI_IOCTL_FLAG_ABORT) {
         omv_csi_abort(csi, true, false);
     }
 
@@ -1418,11 +1721,8 @@ __weak int omv_csi_ioctl(omv_csi_t *csi, int request, ... /* arg */) {
         return OMV_CSI_ERROR_CTL_UNSUPPORTED;
     }
 
-    va_list ap;
-    va_start(ap, request);
     // Call the sensor specific function.
-    int ret = csi->ioctl(csi, request, ap);
-    va_end(ap);
+    int ret = csi->ioctl(csi, request, arg);
 
     return ((ret < 0) ? OMV_CSI_ERROR_CTL_FAILED : ret);
 }
@@ -1659,6 +1959,9 @@ __weak int omv_csi_snapshot(omv_csi_t *csi, image_t *image, uint32_t flags) {
 
         // Release the previous buffer from used queue -> free queue.
         framebuffer_release(csi->fb, FB_FLAG_USED | FB_FLAG_INVALIDATE);
+
+        // The previous image (if any) has been flushed and invalidated.
+        csi->fb->pending = false;
     }
 
     // Toggle FSYNC.
@@ -1711,6 +2014,8 @@ const char *omv_csi_name(omv_csi_t *csi) {
         case LEPTON_2_0:         return "Lepton 2.0";
         case LEPTON_2_5:         return "Lepton 2.5";
         case LEPTON_3_0:         return "Lepton 3.0";
+        case LEPTON_3_1R:        return "Lepton 3.1R";
+        case LEPTON_UW:          return "Lepton UW";
         case LEPTON_3_5:         return "Lepton 3.5";
         case HM01B0_ID:          return "HM01B0";
         case HM0360_ID:          return "HM0360";

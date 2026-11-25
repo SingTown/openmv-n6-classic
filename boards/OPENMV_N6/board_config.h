@@ -51,7 +51,7 @@
 
 #define OMV_LEPTON_ENABLE                   (1)
 #define OMV_PAG7936_ENABLE                  (1)
-#define OMV_PAG7936_MIPI_CSI2               (1)
+#define OMV_PAG7936_BLC_SLOPE               (0.22f)
 #define OMV_SOFTCSI_ENABLE                  (1)
 #define OMV_PS5520_ENABLE                   (1)
 
@@ -163,9 +163,9 @@
 #define OMV_GC_BLOCK1_SIZE                  (24M)
 #define OMV_UMA_BLOCK0_MEMORY               DRAM   // Default UMA pool.
 #define OMV_UMA_BLOCK0_SIZE                 (31M)
-#define OMV_UMA_BLOCK0_FLAGS                (0)
+#define OMV_UMA_BLOCK0_FLAGS                (UMA_EXTERNAL | UMA_DEFAULT)
 #define OMV_UMA_BLOCK1_MEMORY               SRAM1  // Fast UMA pool.
-#define OMV_UMA_BLOCK1_SIZE                 (590K)
+#define OMV_UMA_BLOCK1_SIZE                 (584K)
 #define OMV_UMA_BLOCK1_FLAGS                (UMA_FAST | UMA_DTCM)
 #define OMV_UMA_BLOCK2_MEMORY               DTCM   // DTCM UMA pool.
 #define OMV_UMA_BLOCK2_SIZE                 (128K)
@@ -321,7 +321,10 @@
 #define OMV_CSI_HW_CROP_ENABLE              (1)
 #define OMV_CSI_MAX_DEVICES                 (3)
 #define OMV_CSI_STATS_ENABLE                (1)
+#define OMV_CSI_STATS_IMAGE_ENABLE          (1)
 #define OMV_CSI_HW_SCALE_ENABLE             (1)
+#define OMV_CSI_HW_CCM_ENABLE               (1)
+#define OMV_CSI_HW_BLC_ENABLE               (1)
 
 #define OMV_CSI_D0_PIN                      (&omv_pin_A1_DCMI)
 #define OMV_CSI_D1_PIN                      (&omv_pin_A10_DCMI)

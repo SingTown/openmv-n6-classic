@@ -48,7 +48,6 @@ CFLAGS += -std=gnu11 \
 # TODO: FIX HSE
 CFLAGS += -DCPU_$(MCU) \
           -D$(TARGET) \
-          -DARM_NN_TRUNCATE \
           -D__FPU_PRESENT=1 \
           -D__VFP_FP__ \
           -DHSE_VALUE=$(OMV_HSE_VALUE) \
@@ -116,6 +115,7 @@ include drivers/drivers.mk
 include lib/imlib/imlib.mk
 include lib/apriltag/apriltag.mk
 include lib/tflm/tflm.mk
+include lib/torch/torch.mk
 include ports/ports.mk
 include protocol/protocol.mk
 include common/micropy.mk

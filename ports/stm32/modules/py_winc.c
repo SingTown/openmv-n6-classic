@@ -265,7 +265,9 @@ static mp_obj_t py_winc_ifconfig(size_t n_args, const mp_obj_t *args) {
 
 static mp_obj_t py_winc_netinfo(mp_obj_t self_in) {
     winc_netinfo_t netinfo;
-    winc_netinfo(&netinfo);
+    if (winc_netinfo(&netinfo) != 0) {
+        mp_raise_OSError(MP_ETIMEDOUT);
+    }
 
     // Format MAC address
     VSTR_FIXED(mac_vstr, 18);
@@ -307,12 +309,18 @@ static int winc_scan_callback(winc_scan_result_t *scan_result, void *arg) {
 static mp_obj_t py_winc_scan(mp_obj_t self_in) {
     mp_obj_t scan_list;
     scan_list = mp_obj_new_list(0, NULL);
-    winc_scan(winc_scan_callback, scan_list);
+    if (winc_scan(winc_scan_callback, scan_list) != 0) {
+        mp_raise_OSError(MP_ETIMEDOUT);
+    }
     return scan_list;
 }
 
 static mp_obj_t py_winc_get_rssi(mp_obj_t self_in) {
-    return mp_obj_new_int(winc_get_rssi());
+    int rssi;
+    if (winc_get_rssi(&rssi) != 0) {
+        mp_raise_OSError(MP_ETIMEDOUT);
+    }
+    return mp_obj_new_int(rssi);
 }
 
 static mp_obj_t py_winc_fw_version(mp_obj_t self_in) {
@@ -410,7 +418,8 @@ static int py_winc_socket_socket(mod_network_socket_obj_t *socket, int *_errno) 
 
     // store state of this socket
     socket->fileno = fd;
-    socket->_private = m_new0(winc_socket_buf_t, 1);
+    // Datagram sockets are read with recvfrom(), which doesn't use the socket buffer.
+    socket->_private = (socket->type == MOD_NETWORK_SOCK_STREAM) ? m_new0(winc_socket_buf_t, 1) : NULL;
     return 0;
 }
 
@@ -418,8 +427,10 @@ static void py_winc_socket_close(mod_network_socket_obj_t *socket) {
     if (socket->fileno >= 0) {
         winc_socket_close(socket->fileno);
         socket->fileno = -1; // Mark socket FD as invalid
-        m_del(winc_socket_buf_t, socket->_private, 1);
-        socket->_private = NULL;
+        if (socket->_private != NULL) {
+            m_del(winc_socket_buf_t, socket->_private, 1);
+            socket->_private = NULL;
+        }
         socket->nic = MP_OBJ_NULL;
     }
 }
@@ -493,9 +504,16 @@ static mp_uint_t py_winc_socket_send(mod_network_socket_obj_t *socket, const byt
 }
 
 static mp_uint_t py_winc_socket_recv(mod_network_socket_obj_t *socket, byte *buf, mp_uint_t len, int *_errno) {
-    int ret = winc_socket_recv(socket->fileno, buf, len, socket->_private, socket->timeout);
-    if (ret <= 0) {
-        // NOTE: 0 return from recv() means connection closed.
+    int ret;
+    if (socket->type == MOD_NETWORK_SOCK_DGRAM) {
+        // Datagrams are delivered as SOCKET_MSG_RECVFROM events, so recv() must use recvfrom.
+        sockaddr addr;
+        ret = winc_socket_recvfrom(socket->fileno, buf, len, &addr, socket->timeout);
+    } else {
+        ret = winc_socket_recv(socket->fileno, buf, len, socket->_private, socket->timeout);
+    }
+    // NOTE: 0 means the peer closed the connection, the socket is left open like lwIP.
+    if (ret < 0) {
         *_errno = py_winc_mperrno(ret);
         // The socket is Not closed on timeout.
         if (ret != SOCK_ERR_TIMEOUT) {

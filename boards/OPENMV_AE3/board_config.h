@@ -106,7 +106,7 @@ extern unsigned char OMV_BOARD_UID_ADDR[12];    // Unique address.
 #define OMV_GC_BLOCK0_SIZE              (4M)
 #define OMV_UMA_BLOCK0_MEMORY           SRAM1   // Default UMA pool.
 #define OMV_UMA_BLOCK0_SIZE             (2512K)
-#define OMV_UMA_BLOCK0_FLAGS            (0)
+#define OMV_UMA_BLOCK0_FLAGS            (UMA_DEFAULT)
 #define OMV_UMA_BLOCK1_MEMORY           DTCM    // Fast UMA pool.
 #define OMV_UMA_BLOCK1_SIZE             (512K)
 #define OMV_UMA_BLOCK1_FLAGS            (UMA_DTCM)
@@ -127,7 +127,7 @@ extern unsigned char OMV_BOARD_UID_ADDR[12];    // Unique address.
 #define OMV_GC_BLOCK0_SIZE              (2M)
 #define OMV_UMA_BLOCK0_MEMORY           SRAM6_B // Default UMA pool.
 #define OMV_UMA_BLOCK0_SIZE             (512K)
-#define OMV_UMA_BLOCK0_FLAGS            (0)
+#define OMV_UMA_BLOCK0_FLAGS            (UMA_DEFAULT)
 #endif
 
 // Flash configuration.
@@ -166,10 +166,10 @@ extern unsigned char OMV_BOARD_UID_ADDR[12];    // Unique address.
 #endif
 
 #define OMV_SRAM0_ORIGIN                0x02000000
-#define OMV_SRAM0_LENGTH                4096K
+#define OMV_SRAM0_LENGTH                0x00400000              /* 4M */
 
 #define OMV_SRAM1_ORIGIN                0x08000000
-#define OMV_SRAM1_LENGTH                2560K
+#define OMV_SRAM1_LENGTH                0x00280000              /* 2.5M */
 
 // #define SRAM2_ORIGIN                 0x50000000
 // #define SRAM2_LENGTH                 0x00040000		/* 256K */
@@ -272,6 +272,9 @@ extern unsigned char OMV_BOARD_UID_ADDR[12];    // Unique address.
 #define OMV_CSI_BASE                    ((CPI_Type *) CPI_BASE)
 #define OMV_CSI_CLK_FREQUENCY           (24000000)
 #define OMV_CSI_STATS_ENABLE            (1)
+// The software debayer applies the white balance gains in Q5 and limits them to 4x.
+#define OMV_CSI_STATS_GAIN_MIN          (1.0f / 32.0f)
+#define OMV_CSI_STATS_GAIN_MAX          (4.0f)
 
 #define OMV_CSI_D0_PIN                  (&omv_pin_CSI_D0)
 #define OMV_CSI_D1_PIN                  (&omv_pin_CSI_D1)

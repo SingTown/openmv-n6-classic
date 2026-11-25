@@ -27,7 +27,7 @@ TFLM_SRC_CC = tflm_backend.cc
 
 $(BUILD)/lib/tflm/tflm_backend.o: CXXFLAGS = \
     $(filter-out -std=gnu99 -std=gnu11,$(CFLAGS)) \
-    -std=c++11 \
+    -std=c++17 \
     -fno-rtti \
     -fno-exceptions \
     -fno-use-cxa-atexit \
@@ -38,6 +38,7 @@ $(BUILD)/lib/tflm/tflm_backend.o: CXXFLAGS = \
     -fno-threadsafe-statics \
     -Wno-double-promotion \
     -Wno-float-conversion \
+    -Wno-register \
     -DTF_LITE_STATIC_MEMORY \
     -DTF_LITE_DISABLE_X86_NEON \
     -DKERNELS_OPTIMIZED_FOR_SPEED \
@@ -45,10 +46,8 @@ $(BUILD)/lib/tflm/tflm_backend.o: CXXFLAGS = \
     -I$(TOP_DIR)/lib/tflm/libtflm/include \
     -I$(TOP_DIR)/lib/tflm/libtflm/include/third_party \
     -I$(TOP_DIR)/lib/tflm/libtflm/include/third_party/gemmlowp \
-    -I$(TOP_DIR)/lib/tflm/libtflm/include/third_party/flatbuffers/include \
-    -I$(TOP_DIR)/lib/tflm/libtflm/include/third_party/ethos_u_core_driver/include
+    -I$(TOP_DIR)/lib/tflm/libtflm/include/third_party/flatbuffers/include
 
 OMV_CFLAGS += -I$(TOP_DIR)/lib/tflm/libtflm/include
-OMV_CFLAGS += -I$(TOP_DIR)/lib/tflm/libtflm/include/third_party/ethos_u_core_driver/include
 OMV_FIRM_OBJ += $(addprefix $(BUILD)/lib/tflm/, $(TFLM_SRC_CC:.cc=.o))
 endif

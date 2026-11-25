@@ -9,7 +9,7 @@ CMSIS_MCU_H = \"mps3_an547.h\"
 OMV_BOARD_CFLAGS= -mcmse \
                   -DQEMU_SOC_MPS3 \
                   -DCPU_FREQ_HZ=32000000 \
-                  -DETHOS_U -DETHOSU55 \
+                  -DETHOS_U -DETHOSU_MULTI_VARIANT \
                   -DOMV_NOSYS_STUBS_ENABLE=1
 DEBUGGER=NONE
 VELA_ARGS= "--accelerator-config ethos-u55-256 \
@@ -32,6 +32,7 @@ MICROPY_PY_DISPLAY = 0
 MICROPY_PY_TV = 0
 MICROPY_PY_ML = 1
 MICROPY_PY_ML_TFLM = 1
+MICROPY_PY_ML_TORCH = 1
 MICROPY_PY_LWIP = 0
 MICROPY_PY_SSL = 0
 MICROPY_PY_SSL_ECDSA_SIGN_ALT = 0
