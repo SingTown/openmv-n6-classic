@@ -249,13 +249,14 @@ int ml_backend_run_inference(py_ml_model_obj_t *model) {
     LL_ATON_RT_RetValues_t ll_aton_rt_ret;
     ml_backend_state_t *state = (ml_backend_state_t *) model->state;
 
-    uma_transient_acquire();
-
-    // Flush input buffers.
+    // Flush input buffers. This must happen before uma_transient_acquire(), which
+    // invalidates the cache over the NPU memory and would discard the inputs.
     for (size_t i = 0; i < model->inputs_size; i++) {
         const LL_Buffer_InfoTypeDef *buf = ll_aton_reloc_get_input_buffers_info(&state->nn_inst, i);
         SCB_CleanDCache_by_Addr(LL_Buffer_addr_start(buf), LL_Buffer_len(buf));
     }
+
+    uma_transient_acquire();
 
     LL_ATON_RT_RuntimeInit();
     LL_ATON_RT_Init_Network(&state->nn_inst);

@@ -166,6 +166,18 @@ MPY_MKARGS = PORT=$(PORT) BOARD=$(TARGET) DEBUG=$(DEBUG) MICROPY_MANIFEST_OMV_LI
              FROZEN_MANIFEST=$(FROZEN_MANIFEST) OMV_SRC_QSTR="$(OMV_SRC_QSTR)"\
              MICROPY_ROM_TEXT_COMPRESSION=$(ROM_TEXT_COMPRESSION) USER_C_MODULES=$(TOP_DIR)
 
+# A board may keep its MicroPython board definition in boards/<TARGET>/micropython
+# instead of MicroPython's tree, so a board can be added without forking MicroPython.
+OMV_MP_BOARD_DIR := $(TOP_DIR)/boards/$(TARGET)/micropython
+ifneq ($(wildcard $(OMV_MP_BOARD_DIR)/mpconfigboard.h),)
+export MP_BOARD_CONFIG_DIR:=$(OMV_MP_BOARD_DIR)/
+MPY_BOARD_DIR_ARG = BOARD_DIR=$(OMV_MP_BOARD_DIR)
+MPY_MKARGS += $(MPY_BOARD_DIR_ARG)
+# MicroPython builds these under BUILD/<absolute source path>, which the
+# libmicropython archive step skips for anything inside TOP_DIR.
+MPY_LIB_INCLUDE = -o -path '$(BUILD)/$(MICROPY_DIR)$(OMV_MP_BOARD_DIR)/*'
+endif
+
 # Include the port Makefile.
 include $(OMV_PORT_DIR)/port_config.mk
 
@@ -217,7 +229,7 @@ sdk:
 	$(Q)bash -c "source tools/ci.sh && ci_install_sdk"
 
 submodules:
-	$(MAKE) -C $(MICROPY_DIR)/ports/$(PORT) BOARD=$(TARGET) submodules
+	$(MAKE) -C $(MICROPY_DIR)/ports/$(PORT) BOARD=$(TARGET) $(MPY_BOARD_DIR_ARG) submodules
 
 debug: $(ROMFS_IMAGE)
 ifeq ($(DEBUGGER),NONE)
