@@ -154,11 +154,11 @@
 #define OMV_HEAP_MEMORY                     SRAM1  // libc/sbrk heap memory
 #define OMV_HEAP_SIZE                       (128K)
 #define OMV_SB_MEMORY                       SRAM2   // Streaming buffer memory.
-#define OMV_SB_SIZE                         (64K)   // Streaming buffer size.
+#define OMV_SB_SIZE                         (96K)   // Streaming buffer size.
 #define OMV_DMA_MEMORY                      SRAM2  // Misc DMA buffers memory.
 #define OMV_DMA_MEMORY_D2                   SRAM7  // Domain 2 DMA buffers.
 #define OMV_GC_BLOCK0_MEMORY                SRAM2  // Main GC block
-#define OMV_GC_BLOCK0_SIZE                  (640K)
+#define OMV_GC_BLOCK0_SIZE                  (768K)
 #define OMV_UMA_BLOCK0_MEMORY               SRAM1  // Default UMA pool.
 #define OMV_UMA_BLOCK0_SIZE                 (896K)
 #define OMV_UMA_BLOCK0_FLAGS                (UMA_DEFAULT)
