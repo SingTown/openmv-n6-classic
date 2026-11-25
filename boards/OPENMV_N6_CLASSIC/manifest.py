@@ -12,18 +12,9 @@ freeze ("$(OMV_LIB_DIR)/", "machine.py")
 freeze ("$(OMV_LIB_DIR)/", "display.py")
 freeze ("$(OMV_LIB_DIR)/", "sensor.py")
 
-# Bluetooth
-require("aioble")
-
-# Networking
+# Communication (no WiFi, Bluetooth or Ethernet on this board)
 require("ssl")
-require("ntptime")
-require("webrepl")
 freeze ("$(OMV_LIB_DIR)/", "rpc.py")
-freeze ("$(OMV_LIB_DIR)/", "rtsp.py")
-freeze ("$(OMV_LIB_DIR)/", "mqtt.py")
-freeze ("$(OMV_LIB_DIR)/", "requests.py")
-require("microdot-lib")
 
 # Utils
 require("time")
