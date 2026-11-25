@@ -182,7 +182,7 @@ ifeq ($(OMV_SIGN_BOOT), 1)
 endif
 endif
 
-$(ROMFS_IMAGE): $(ROMFS_CONFIG) | $(FIRMWARE) $(BOOTLOADER)
+$(ROMFS_IMAGE): $(ROMFS_CONFIG) $(wildcard $(TOP_DIR)/lib/stai/scripts/*) | $(FIRMWARE) $(BOOTLOADER)
 	$(ECHO) "GEN romfs image"
 	$(PYTHON) $(TOOLS_DIR)/$(MKROMFS) \
         --top-dir $(TOP_DIR) \
