@@ -70,7 +70,7 @@
 #define OMV_PROTOCOL_STDIO_BUFFER_SIZE      (2048)
 #define OMV_PROTOCOL_HW_CAPS                OMV_PROTOCOL_HW_CAPS_MAKE( \
         HAS_GPU, HAS_NPU, HAS_ISP, HAS_VENC, HAS_JPEG, HAS_CRC,        \
-        HAS_PMU, HAS_WIFI, HAS_BT, HAS_SD, HAS_ETH, HAS_USB_HS)
+        HAS_PMU, HAS_SD, HAS_USB_HS)
 
 //PLL1 800MHz
 #define OMV_OSC_PLL1M                       (3)
@@ -111,7 +111,7 @@
 #define OMV_RCC_IC10_SOURCE                 (RCC_ICCLKSOURCE_PLL1)
 #define OMV_RCC_IC10_CLKDIV                 (8)
 
-// Used by MicroPython for ethernet clocks.
+// IC12 only feeds ETH1, which this board does not have; kept as MicroPython also sets it.
 #define OMV_RCC_IC12_SOURCE                 (RCC_ICCLKSOURCE_PLL1)
 #define OMV_RCC_IC12_CLKDIV                 (8)
 
@@ -274,13 +274,6 @@
 // TOF I2C bus
 #define OMV_TOF_I2C_ID                      (OMV_I2C2_ID)
 #define OMV_TOF_I2C_SPEED                   (OMV_I2C_SPEED_FULL)
-
-// IMU SPI bus
-#define OMV_IMU_I2C_ID                      (OMV_I2C4_ID)
-#define OMV_IMU_I2C_SPEED                   (OMV_I2C_SPEED_FULL)
-#define OMV_IMU_CHIP_LSM6DSM                (1)
-#define OMV_IMU_X_Y_ROTATION_DEGREES        90
-#define OMV_IMU_MOUNTING_Z_DIRECTION        -1
 
 // MDF1
 #define OMV_MDF                             (ADF1_Filter0)

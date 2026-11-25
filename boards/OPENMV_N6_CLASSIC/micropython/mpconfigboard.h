@@ -50,10 +50,6 @@
 #define MICROPY_HW_BDEV_SPIFLASH_SIZE_BYTES     (4 * 1024 * 1024)
 
 // UART buses
-#define MICROPY_HW_UART2_TX         (pyb_pin_BT_TXD)
-#define MICROPY_HW_UART2_RX         (pyb_pin_BT_RXD)
-#define MICROPY_HW_UART2_RTS        (pyb_pin_BT_RTS)
-#define MICROPY_HW_UART2_CTS        (pyb_pin_BT_CTS)
 #define MICROPY_HW_UART3_TX         (pyb_pin_UART3_TX)
 #define MICROPY_HW_UART3_RX         (pyb_pin_UART3_RX)
 #define MICROPY_HW_UART3_RTS        (pyb_pin_UART3_RTS)
@@ -115,15 +111,6 @@
 #define MICROPY_HW_SDCARD_DETECT_PULL       (GPIO_NOPULL)
 #define MICROPY_HW_SDCARD_DETECT_PRESENT    (GPIO_PIN_RESET)
 
-// WiFi SDMMC
-#define MICROPY_HW_SDIO_SDMMC       (2)
-#define MICROPY_HW_SDIO_CK          (pyb_pin_WL_SDIO_CK)
-#define MICROPY_HW_SDIO_CMD         (pyb_pin_WL_SDIO_CMD)
-#define MICROPY_HW_SDIO_D0          (pyb_pin_WL_SDIO_D0)
-#define MICROPY_HW_SDIO_D1          (pyb_pin_WL_SDIO_D1)
-#define MICROPY_HW_SDIO_D2          (pyb_pin_WL_SDIO_D2)
-#define MICROPY_HW_SDIO_D3          (pyb_pin_WL_SDIO_D3)
-
 // USB config
 #define MICROPY_HW_USB_HS           (1)
 #define MICROPY_HW_USB_HS_IN_FS     (1)
@@ -135,35 +122,6 @@
 #define MICROPY_HW_USB_PID_CDC_MSC  (MICROPY_HW_USB_PID)
 #define MICROPY_HW_USB_PID_CDC_HID  (MICROPY_HW_USB_PID)
 #define MICROPY_HW_USB_PID_CDC_MSC_HID  (MICROPY_HW_USB_PID)
-
-// Ethernet via RGMII
-#define NETWORK_LAN_PHY                         (ETH_PHY_RTL8211)
-#define MICROPY_HW_ETH_MDC                      (pin_D1)
-#define MICROPY_HW_ETH_MDIO                     (pin_D12)
-#define MICROPY_HW_ETH_RGMII_CLK125             (pin_F2)
-#define MICROPY_HW_ETH_RGMII_GTX_CLK            (pin_F0)
-#define MICROPY_HW_ETH_RGMII_TXD0               (pin_F12)
-#define MICROPY_HW_ETH_RGMII_TXD1               (pin_F13)
-#define MICROPY_HW_ETH_RGMII_TXD2               (pin_G3)
-#define MICROPY_HW_ETH_RGMII_TXD3               (pin_G4)
-#define MICROPY_HW_ETH_RGMII_TX_CTL             (pin_F11)
-#define MICROPY_HW_ETH_RGMII_RX_CLK             (pin_F7)
-#define MICROPY_HW_ETH_RGMII_RXD0               (pin_F14)
-#define MICROPY_HW_ETH_RGMII_RXD1               (pin_F15)
-#define MICROPY_HW_ETH_RGMII_RXD2               (pin_F8)
-#define MICROPY_HW_ETH_RGMII_RXD3               (pin_F9)
-#define MICROPY_HW_ETH_RGMII_RX_CTL             (pin_F10)
-
-// Murata 1YN configuration
-#define CYW43_CHIPSET_FIRMWARE_INCLUDE_FILE     "lib/cyw43-driver/firmware/w43439_sdio_1yn_7_95_59_combined.h"
-#define CYW43_WIFI_NVRAM_INCLUDE_FILE           "lib/cyw43-driver/firmware/wifi_nvram_1yn.h"
-#define CYW43_BT_FIRMWARE_INCLUDE_FILE          "lib/cyw43-driver/firmware/cyw43_btfw_1yn.h"
-
-// Bluetooth config
-#define MICROPY_HW_BLE_UART_ID                  (PYB_UART_2)
-#define MICROPY_HW_BLE_UART_BAUDRATE            (115200)
-#define MICROPY_HW_BLE_UART_BAUDRATE_SECONDARY  (3000000)
-#define MICROPY_HW_BLE_UART_BAUDRATE_DOWNLOAD_FIRMWARE (3000000)
 
 // USB CDC config
 #define CFG_TUD_CDC_EP_BUFSIZE  (4096)
