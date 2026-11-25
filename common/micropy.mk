@@ -225,6 +225,7 @@ MPY_CFLAGS += -DMICROPY_BOARD_PENDSV_ENTRIES="$(MPY_PENDSV_ENTRIES)"
 .DEFAULT_GOAL := all
 MPY_MAKE_FILE ?=
 MPY_MAKE_TARGET ?=
+MPY_LIB_INCLUDE ?=
 MPY_LIB = $(BUILD)/lib/libmicropython.a
 
 .PHONY: FORCE
@@ -234,7 +235,7 @@ $(MPY_LIB): FORCE | FIRM_DIRS
 	$(ECHO) "AR $@"
 	$(RM) -f $@
 	$(AR) rcs $@ $$(find $(BUILD)/$(MICROPY_DIR) -name '*.o' \
-        ! -path '$(BUILD)/$(MICROPY_DIR)$(TOP_DIR)/*' \
+        \( ! -path '$(BUILD)/$(MICROPY_DIR)$(TOP_DIR)/*' $(MPY_LIB_INCLUDE) \) \
         ! -name 'main.*' \
         ! -name 'pendsv.*' \
         $(MPY_LIB_EXCLUDE))
