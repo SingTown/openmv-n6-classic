@@ -75,7 +75,8 @@ typedef struct ml_backend_state {
     MicroInterpreter *interpreter;
 } ml_backend_state_t;
 
-void abort(void) {
+// Allow  ports that provide their own abort() to take precedence.
+__attribute__((weak)) void abort(void) {
     while (1) {
         ;
     }
@@ -110,6 +111,8 @@ static char ml_backend_map_dtype(TfLiteType type) {
 }
 
 static void ml_backend_init_ops_resolver(MicroOpsResolver *resolver) {
+    // MICROPY_PY_ML_TFLM_SMALL excludes rarely used ops (comparisons, SelectV2 and
+    // SquaredDifference) to save flash on boards with small flash.
     resolver->AddAbs();
     resolver->AddAdd();
     resolver->AddAddN();
@@ -138,7 +141,9 @@ static void ml_backend_init_ops_resolver(MicroOpsResolver *resolver) {
     resolver->AddElu();
     resolver->AddEmbeddingLookup();
     resolver->AddEnergy();
+    #if !MICROPY_PY_ML_TFLM_SMALL
     resolver->AddEqual();
+    #endif
     #ifdef ETHOS_U
     resolver->AddEthosU();
     #endif
@@ -157,16 +162,20 @@ static void ml_backend_init_ops_resolver(MicroOpsResolver *resolver) {
     resolver->AddFullyConnected();
     resolver->AddGather();
     resolver->AddGatherNd();
+    #if !MICROPY_PY_ML_TFLM_SMALL
     resolver->AddGreater();
     resolver->AddGreaterEqual();
+    #endif
     resolver->AddHardSwish();
     resolver->AddIf();
     resolver->AddIrfft();
     resolver->AddL2Normalization();
     resolver->AddL2Pool2D();
     resolver->AddLeakyRelu();
+    #if !MICROPY_PY_ML_TFLM_SMALL
     resolver->AddLess();
     resolver->AddLessEqual();
+    #endif
     resolver->AddLog();
     resolver->AddLogSoftmax();
     resolver->AddLogicalAnd();
@@ -180,7 +189,9 @@ static void ml_backend_init_ops_resolver(MicroOpsResolver *resolver) {
     resolver->AddMirrorPad();
     resolver->AddMul();
     resolver->AddNeg();
+    #if !MICROPY_PY_ML_TFLM_SMALL
     resolver->AddNotEqual();
+    #endif
     resolver->AddOverlapAdd();
     resolver->AddPCAN();
     resolver->AddPack();
@@ -198,7 +209,9 @@ static void ml_backend_init_ops_resolver(MicroOpsResolver *resolver) {
     resolver->AddRfft();
     resolver->AddRound();
     resolver->AddRsqrt();
+    #if !MICROPY_PY_ML_TFLM_SMALL
     resolver->AddSelectV2();
+    #endif
     resolver->AddShape();
     resolver->AddSin();
     resolver->AddSlice();
@@ -209,7 +222,9 @@ static void ml_backend_init_ops_resolver(MicroOpsResolver *resolver) {
     resolver->AddSplitV();
     resolver->AddSqrt();
     resolver->AddSquare();
+    #if !MICROPY_PY_ML_TFLM_SMALL
     resolver->AddSquaredDifference();
+    #endif
     resolver->AddSqueeze();
     resolver->AddStacker();
     resolver->AddStridedSlice();
@@ -227,7 +242,7 @@ static void ml_backend_init_ops_resolver(MicroOpsResolver *resolver) {
     resolver->AddZerosLike();
 }
 
-int ml_backend_init_model(py_ml_model_obj_t *model) {
+static int ml_backend_init_model(py_ml_model_obj_t *model) {
     RegisterDebugLogCallback(ml_backend_log_handler);
 
     // Parse the model's data.
@@ -329,7 +344,10 @@ int ml_backend_init_model(py_ml_model_obj_t *model) {
     return 0;
 }
 
-int ml_backend_run_inference(py_ml_model_obj_t *model) {
+static void ml_backend_deinit_model(py_ml_model_obj_t *model) {
+}
+
+static int ml_backend_run_inference(py_ml_model_obj_t *model) {
     OMV_PROFILER_ENTER(ml_backend_run_inference);
 
     RegisterDebugLogCallback(ml_backend_log_handler);
@@ -343,7 +361,7 @@ int ml_backend_run_inference(py_ml_model_obj_t *model) {
     return 0;
 }
 
-void *ml_backend_get_input(py_ml_model_obj_t *model, size_t index) {
+static void *ml_backend_get_input(py_ml_model_obj_t *model, size_t index) {
     ml_backend_state_t *state = (ml_backend_state_t *) model->state;
     if (index < state->interpreter->inputs_size()) {
         return state->interpreter->input(index)->data.data;
@@ -351,13 +369,28 @@ void *ml_backend_get_input(py_ml_model_obj_t *model, size_t index) {
     mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("Invalid input tensor index"));
 }
 
-void *ml_backend_get_output(py_ml_model_obj_t *model, size_t index) {
+static void *ml_backend_get_output(py_ml_model_obj_t *model, size_t index) {
     ml_backend_state_t *state = (ml_backend_state_t *) model->state;
     if (index < state->interpreter->outputs_size()) {
         return state->interpreter->output(index)->data.data;
     }
     mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("Invalid output tensor index"));
 }
+
+static bool ml_backend_probe(const uint8_t *data, size_t size) {
+    // TFLite flatbuffers carry the "TFL3" identifier at offset 4.
+    return size >= 8 && ModelBufferHasIdentifier(data);
+}
+
+const ml_backend_t ml_backend_tflm = {
+    "tflm",
+    ml_backend_probe,
+    ml_backend_init_model,
+    ml_backend_deinit_model,
+    ml_backend_run_inference,
+    ml_backend_get_input,
+    ml_backend_get_output,
+};
 } // extern "C"
 #endif // MICROPY_PY_ML_TFLM
 

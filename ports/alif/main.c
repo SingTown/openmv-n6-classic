@@ -85,10 +85,12 @@
 #include "py_imu.h"
 #include "omv_gpio.h"
 #include "omv_protocol.h"
+#include "py_protocol.h"
 
 NORETURN void __fatal_error(const char *msg);
 extern void machine_pwm_deinit_all(void);
 extern void machine_pin_irq_deinit(void);
+extern void machine_can_deinit_all(void);
 
 int main(void) {
     bool first_soft_reset = true; (void) first_soft_reset;
@@ -98,6 +100,7 @@ int main(void) {
 
     pendsv_init();
     lptimer_init();
+    machine_init();
     machine_rtc_init();
 
     #if MICROPY_HW_ENABLE_UART_REPL
@@ -123,6 +126,9 @@ soft_reset:
     mp_init();
 
     // Initialise sub-systems.
+    #if MICROPY_PY_PROTOCOL
+    py_protocol_init0();
+    #endif // MICROPY_PY_PROTOCOL
     uma_init();
     readline_init0();
     framebuffer_init0();
@@ -184,9 +190,11 @@ soft_reset:
     omv_protocol_init_default();
     #endif
 
-    // Run boot.py every reset and main.py on first soft-reset
-    if (pyexec_file_if_exists("boot.py") && first_soft_reset) {
+    // Run boot.py every reset and main.py on first soft-reset, followed by a soft-reset.
+    if (pyexec_file_if_exists("boot.py") && first_soft_reset &&
+        mp_import_stat("main.py") == MP_IMPORT_STAT_FILE) {
         pyexec_file_if_exists("main.py");
+        goto soft_reset_exit;
     }
 
     #if CORE_M55_HE
@@ -213,9 +221,7 @@ soft_reset:
         }
     }
 
-#if CORE_M55_HE
 soft_reset_exit:
-#endif
     mp_hal_set_interrupt_char(-1);
     mp_printf(MP_PYTHON_PRINTER, "MPY: soft reboot\n");
     omv_protocol_deinit();
@@ -237,8 +243,12 @@ soft_reset_exit:
     #if MICROPY_PY_MACHINE_I2C_TARGET
     mp_machine_i2c_target_deinit_all();
     #endif
+    #if MICROPY_PY_MACHINE_CAN
+    machine_can_deinit_all();
+    #endif
     machine_pwm_deinit_all();
     machine_pin_irq_deinit();
+    machine_set_soft_reset();
     imlib_deinit();
     soft_timer_deinit();
     dma_deinit_all();

@@ -41,7 +41,6 @@ CFLAGS += -std=gnu11 \
 
 CFLAGS += -D$(TARGET) \
           -DQEMU_BUILD \
-          -DARM_NN_TRUNCATE=1 \
           -DCMSIS_MCU_H=$(CMSIS_MCU_H) \
           -DOMV_CPU_FREQ_HZ=$(CPU_FREQ_HZ) \
           $(OMV_BOARD_CFLAGS)
@@ -75,7 +74,6 @@ CLANG_FLAGS +=-fshort-enums \
               -Wno-shift-count-overflow \
               -Wno-ignored-optimization-argument \
               -Wno-unused-command-line-argument \
-              -D__ARMCC_VERSION=6100100 \
               -DALIF_CMSIS_H=$(CMSIS_MCU_H) \
               $(filter-out -march% -fdisable-rtl%,$(CFLAGS))
 
@@ -108,13 +106,14 @@ include drivers/drivers.mk
 include lib/imlib/imlib.mk
 include lib/apriltag/apriltag.mk
 include lib/tflm/tflm.mk
+include lib/torch/torch.mk
 include ports/ports.mk
 include common/micropy.mk
 
 ifeq ($(MICROPY_PY_ML_TFLM), 1)
 ifeq ($(CPU),cortex-m55)
 ifneq ($(filter -DETHOS_U,$(OMV_BOARD_CFLAGS)),)
-LIBS += $(TOP_DIR)/$(TENSORFLOW_DIR)/libtflm/lib/libtflm-cortex-m55-u55-release.a
+LIBS += $(TOP_DIR)/$(TENSORFLOW_DIR)/libtflm/lib/libtflm-cortex-m55-ethosu-release.a
 else
 LIBS += $(TOP_DIR)/$(TENSORFLOW_DIR)/libtflm/lib/libtflm-cortex-m55-release.a
 endif

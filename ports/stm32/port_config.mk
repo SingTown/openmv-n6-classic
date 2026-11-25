@@ -58,7 +58,6 @@ CFLAGS += -std=gnu11 \
 
 CFLAGS += -D$(MCU) \
           -D$(TARGET) \
-          -DARM_NN_TRUNCATE \
           -D__VFP_FP__ \
           -DUSE_FULL_LL_DRIVER \
           -DHSE_VALUE=$(OMV_HSE_VALUE)\
@@ -89,6 +88,11 @@ LDFLAGS += -Wl,--wrap=usbd_cdc_control \
            -Wl,--wrap=usbd_cdc_receive \
            -Wl,--wrap=mp_os_dupterm_rx_chr \
            -Wl,--wrap=mp_hal_stdout_tx_strn
+endif
+
+# The Cortex-M7 data cache needs DMA regions aligned to their size for the MPU.
+ifeq ($(CPU),cortex-m7)
+LDSCRIPT_FLAGS += -DOMV_DMA_MPU_ALIGN
 endif
 
 ifneq ($(OMV_RAMFUNC_OBJS),)

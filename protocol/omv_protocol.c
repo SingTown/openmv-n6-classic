@@ -65,6 +65,7 @@ int omv_protocol_init(const omv_protocol_config_t *config) {
 
     // Initialize state
     ctx.sequence = 0;
+    ctx.suspended = false;
     ctx.last_lock_ms = 0;
     ctx.scan_offset = 0;
     ctx.wait_for_ack = false;
@@ -84,6 +85,7 @@ int omv_protocol_init(const omv_protocol_config_t *config) {
 
     // Start periodic poll timer if configured.
     if (config->poll_ms > 0) {
+        soft_timer_remove(&protocol_timer);     // no-op if unlinked, unlinks if linked
         soft_timer_static_init(&protocol_timer, SOFT_TIMER_MODE_PERIODIC,
                                config->poll_ms, omv_protocol_poll_callback);
         soft_timer_insert(&protocol_timer, config->poll_ms);
@@ -129,12 +131,15 @@ int omv_protocol_init_default() {
 }
 
 void omv_protocol_deinit(void) {
+    // Leave anything the host sends in the transport until the next init.
+    ctx.suspended = true;
+
     if (ctx.config.poll_ms > 0) {
         soft_timer_remove(&protocol_timer);
     }
 
     // Deinitialize all channels, unregister dynamic ones.
-    for (int i = 0; i < OMV_PROTOCOL_MAX_CHANNELS; i++) {
+    for (int i = 0; i < OMV_PROTOCOL_CHANNEL_MAX; i++) {
         if (ctx.channels[i]) {
             if (ctx.channels[i]->deinit) {
                 ctx.channels[i]->deinit(ctx.channels[i]);
@@ -195,6 +200,11 @@ bool omv_protocol_exec_script(void) {
 
     bool result = channel->exec(channel);
     if (result) {
+        // The main loop soft-reboots next. Stop consuming host packets right
+        // away (sending the event below polls the transport): anything the
+        // host sends from here on is processed after the protocol is
+        // initialized again, not by a context that is about to be torn down.
+        ctx.suspended = true;
         omv_protocol_send_event(0, OMV_PROTOCOL_EVENT_SOFT_REBOOT, false);
     }
 
@@ -211,12 +221,17 @@ int omv_protocol_register_channel(const omv_protocol_channel_t *channel) {
         channel_id = channel->id;
     } else {
         // Find the first free channel
-        for (size_t i = 1; i < OMV_PROTOCOL_MAX_CHANNELS; i++) {
+        for (size_t i = 1; i < OMV_PROTOCOL_CHANNEL_MAX; i++) {
             if (ctx.channels[i] == NULL) {
                 channel_id = i;
                 break;
             }
         }
+    }
+
+    // No free channel slots
+    if (channel_id == -1) {
+        return -1;
     }
 
     // Initialize the channel
@@ -466,7 +481,7 @@ int omv_protocol_poll(void) {
         return -1;
     }
 
-    if (!transport || !transport->is_active(transport)) {
+    if (!transport || !transport->is_active(transport) || ctx.suspended) {
         return -1;
     }
 
@@ -811,7 +826,7 @@ void omv_protocol_process(const omv_protocol_packet_t *packet) {
         case OMV_PROTOCOL_OPCODE_CHANNEL_LIST: {
             // Build list of registered channels
             int ch_count = 0;
-            omv_protocol_channel_entry_t ch_list[OMV_PROTOCOL_MAX_CHANNELS];
+            omv_protocol_channel_entry_t ch_list[OMV_PROTOCOL_CHANNEL_MAX];
 
             for (int i = 0; i < ctx.channels_count; i++) {
                 if (ctx.channels[i] != NULL) {
@@ -938,7 +953,7 @@ void omv_protocol_process(const omv_protocol_packet_t *packet) {
             const omv_protocol_channel_t *channel = omv_protocol_find_channel(packet->channel);
 
             if (channel && channel->write && request->length) {
-                if (channel->write(channel, request->offset, request->length, request->payload)) {
+                if (channel->write(channel, request->offset, request->length, request->payload) > 0) {
                     omv_protocol_send_status(packet->opcode, packet->channel, OMV_PROTOCOL_STATUS_SUCCESS);
                 } else {
                     omv_protocol_send_status(packet->opcode, packet->channel, OMV_PROTOCOL_STATUS_FAILED);

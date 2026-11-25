@@ -28,6 +28,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <errno.h>
+#include "py/mphal.h"
+#include "py/runtime.h"
+#include "py/mphal.h"
+#include "py/runtime.h"
 #include "winc.h"
 #include "omv_common.h"
 
@@ -311,6 +315,10 @@ static void wifi_callback_sta(uint8_t msg_type, void *msg) {
     switch (msg_type) {
 
         case M2M_WIFI_RESP_CURRENT_RSSI: {
+            if (async_request_data == NULL) {
+                // A reply to a request that has already timed out.
+                break;
+            }
             int rssi = *((int8_t *) msg);
             *((int *) async_request_data) = rssi;
             async_request_done = true;
@@ -354,6 +362,10 @@ static void wifi_callback_sta(uint8_t msg_type, void *msg) {
         }
 
         case M2M_WIFI_RESP_CONN_INFO: {
+            if (async_request_data == NULL) {
+                // A reply to a request that has already timed out.
+                break;
+            }
             // Connection info
             tstrM2MConnInfo *con_info = (tstrM2MConnInfo *) msg;
             winc_netinfo_t *netinfo = (winc_netinfo_t *) async_request_data;
@@ -377,6 +389,10 @@ static void wifi_callback_sta(uint8_t msg_type, void *msg) {
         }
 
         case M2M_WIFI_RESP_SCAN_DONE: {
+            if (async_request_data == NULL) {
+                // A reply to a request that has already timed out.
+                break;
+            }
             scan_request_index = 0;
             tstrM2mScanDone *scan_result = (tstrM2mScanDone *) msg;
 
@@ -393,6 +409,10 @@ static void wifi_callback_sta(uint8_t msg_type, void *msg) {
         }
 
         case M2M_WIFI_RESP_SCAN_RESULT: {
+            if (async_request_data == NULL) {
+                // A reply to a request that has already timed out.
+                break;
+            }
             tstrM2mWifiscanResult *scan_result;
             scan_result = (tstrM2mWifiscanResult *) msg;
 
@@ -568,6 +588,13 @@ int winc_init(winc_mode_t winc_mode) {
 int winc_connect(const char *ssid, uint8_t security, const char *key, uint16_t channel) {
     async_request_data = &ifconfig;
 
+    // Drain events left over from a previous connection, such as the state change
+    // that disconnect() requests but never waits for, so that they can't satisfy
+    // the wait below before this connection has even been attempted.
+    m2m_wifi_handle_events(NULL);
+    ip_obtained = false;
+    wlan_connected = false;
+
     //Disable/Enable DHCP client before connecting.
     m2m_wifi_enable_dhcp(!use_static_ip);
 
@@ -576,11 +603,20 @@ int winc_connect(const char *ssid, uint8_t security, const char *key, uint16_t c
         return -1;
     }
 
-    async_request_done = false;
-    while (async_request_done == false) {
-        __WFI();
+    // Wait for the connection to come all the way up. Note this waits on the
+    // connection state, not on any event arriving: a failed connection reports
+    // the same state change as a disconnection, and would otherwise be reported
+    // to the caller as success.
+    mp_uint_t tick_start = mp_hal_ticks_ms();
+    while (winc_isconnected() == 0) {
         // Handle pending events from network controller.
         m2m_wifi_handle_events(NULL);
+        // Wait on MicroPython's event handler rather than WFI, so that scheduled
+        // callbacks still run and a KeyboardInterrupt can break out of the wait.
+        mp_event_wait_ms(1);
+        if ((mp_hal_ticks_ms() - tick_start) >= WINC_CONNECT_TIMEOUT) {
+            return -1;
+        }
     }
     return 0;
 }
@@ -619,9 +655,13 @@ int winc_start_ap(const char *ssid, uint8_t security, const char *key, uint16_t 
 }
 
 int winc_disconnect() {
+    int ret = m2m_wifi_disconnect();
+    // Let the state change land here rather than leaving it pending for the
+    // next request to trip over.
+    m2m_wifi_handle_events(NULL);
     ip_obtained = false;
     wlan_connected = false;
-    return m2m_wifi_disconnect();
+    return ret;
 }
 
 int winc_isconnected() {
@@ -666,6 +706,27 @@ int winc_ifconfig(winc_ifconfig_t *rifconfig, bool set) {
     return 0;
 }
 
+// Wait for an async request to complete. The request buffer is owned by the
+// caller's stack frame, so it's dropped on the way out: without that, a reply
+// arriving after a timeout would be written to a frame that no longer exists.
+static int winc_wait_for_request(uint32_t timeout) {
+    int ret = 0;
+    mp_uint_t tick_start = mp_hal_ticks_ms();
+
+    while (async_request_done == false) {
+        // Handle pending events from network controller.
+        m2m_wifi_handle_events(NULL);
+        mp_event_wait_ms(1);
+        if ((mp_hal_ticks_ms() - tick_start) >= timeout) {
+            ret = -1;
+            break;
+        }
+    }
+
+    async_request_data = NULL;
+    return ret;
+}
+
 int winc_netinfo(winc_netinfo_t *netinfo) {
     async_request_done = false;
     async_request_data = netinfo;
@@ -673,13 +734,7 @@ int winc_netinfo(winc_netinfo_t *netinfo) {
     // Request connection info
     m2m_wifi_get_connection_info();
 
-    while (async_request_done == false) {
-        __WFI();
-        // Handle pending events from network controller.
-        m2m_wifi_handle_events(NULL);
-    }
-
-    return 0;
+    return winc_wait_for_request(WINC_REQUEST_TIMEOUT);
 }
 
 int winc_scan(winc_scan_callback_t cb, void *arg) {
@@ -690,30 +745,17 @@ int winc_scan(winc_scan_callback_t cb, void *arg) {
     // Request scan.
     m2m_wifi_request_scan(M2M_WIFI_CH_ALL);
 
-    while (async_request_done == false) {
-        __WFI();
-        // Handle pending events from network controller.
-        m2m_wifi_handle_events(NULL);
-    }
-
-    return 0;
+    return winc_wait_for_request(WINC_SCAN_TIMEOUT);
 }
 
-int winc_get_rssi() {
-    int rssi;
+int winc_get_rssi(int *rssi) {
     async_request_done = false;
-    async_request_data = &rssi;
+    async_request_data = rssi;
 
     // Request RSSI.
     m2m_wifi_req_curr_rssi();
 
-    while (async_request_done == false) {
-        __WFI();
-        // Handle pending events from network controller.
-        m2m_wifi_handle_events(NULL);
-    }
-
-    return rssi;
+    return winc_wait_for_request(WINC_REQUEST_TIMEOUT);
 }
 
 int winc_fw_version(winc_fwver_t *wfwver) {
@@ -880,6 +922,11 @@ int winc_socket_send(int fd, const uint8_t *buf, uint32_t len, uint32_t timeout)
 
 int winc_socket_recv(int fd, uint8_t *buf, uint32_t len, winc_socket_buf_t *sockbuf, uint32_t timeout) {
     if (sockbuf->size == 0) {
+        if (sockbuf->closed) {
+            // The peer has closed the connection, return EOF without another HIF request.
+            return 0;
+        }
+
         // No buffered data.
         sockbuf->idx = 0; // Reset sockbuf index.
 
@@ -895,7 +942,13 @@ int winc_socket_recv(int fd, uint8_t *buf, uint32_t len, winc_socket_buf_t *sock
 
         // Check received bytes returned from async request.
         if (ret != SOCK_ERR_NO_ERROR || recv_bytes <= 0) {
-            return (ret != SOCK_ERR_NO_ERROR) ? ret : recv_bytes;
+            int error = (ret != SOCK_ERR_NO_ERROR) ? ret : recv_bytes;
+            if (error == SOCK_ERR_NO_ERROR || error == SOCK_ERR_CONN_ABORTED) {
+                // Peer closed the connection, latch EOF and leave the socket open, like lwIP.
+                sockbuf->closed = true;
+                return 0;
+            }
+            return error;
         }
 
         sockbuf->size = recv_bytes;
@@ -942,6 +995,9 @@ int winc_socket_sendto(int fd, const uint8_t *buf, uint32_t len, sockaddr *addr,
 
 int winc_socket_recvfrom(int fd, uint8_t *buf, uint32_t len, sockaddr *addr, uint32_t timeout) {
     memset(addr, 0, sizeof(sockaddr));
+
+    // The firmware never replies to requests larger than the datagram it can deliver.
+    len = OMV_MIN(len, WINC_MAX_DGRAM_SIZE);
 
     recv_from_t rfrom;
     int ret = WINC1500_EXPORT(recvfrom) (fd, buf, len, timeout);

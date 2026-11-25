@@ -40,6 +40,7 @@
 #include "py/mphal.h"
 #include "framebuffer.h"
 #include "omv_csi.h"
+#include "boson.h"
 
 #include "Client_API.h"
 #include "UART_Connector.h"
@@ -153,6 +154,234 @@ static int post_process(omv_csi_t *csi, image_t *image, uint32_t flags) {
     return 0;
 }
 
+static int ioctl(omv_csi_t *csi, int request, void *arg) {
+    int ret = 0;
+    boson_ioctl_arg_t *a = arg;
+
+    FSLP_set_csi(csi);
+
+    switch (request) {
+        case OMV_CSI_IOCTL_BOSON_GET_SOFTWARE_REV: {
+            ret = bosonGetSoftwareRev(&a->rev.major, &a->rev.minor, &a->rev.patch) == FLR_OK ? 0 : -1;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_GET_FPA_TEMP: {
+            int16_t fpa_temp = 0;
+            ret = bosonlookupFPATempDegCx10(&fpa_temp) == FLR_OK ? 0 : -1;
+            a->fvalue = fpa_temp / 10.0f;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_SET_GAIN_MODE: {
+            ret = bosonSetGainMode((FLR_BOSON_GAINMODE_E) a->ivalue) == FLR_OK ? 0 : -1;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_GET_GAIN_MODE: {
+            FLR_BOSON_GAINMODE_E gain_mode = FLR_BOSON_HIGH_GAIN;
+            ret = bosonGetGainMode(&gain_mode) == FLR_OK ? 0 : -1;
+            a->ivalue = gain_mode;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_RUN_FFC: {
+            ret = bosonRunFFC() == FLR_OK ? 0 : -1;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_GET_FFC_STATUS: {
+            FLR_BOSON_FFCSTATUS_E ffc_status = FLR_BOSON_NO_FFC_PERFORMED;
+            ret = bosonGetFfcStatus(&ffc_status) == FLR_OK ? 0 : -1;
+            a->ivalue = ffc_status;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_SET_FFC_MODE: {
+            ret = bosonSetFFCMode((FLR_BOSON_FFCMODE_E) a->ivalue) == FLR_OK ? 0 : -1;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_GET_FFC_MODE: {
+            FLR_BOSON_FFCMODE_E ffc_mode = FLR_BOSON_MANUAL_FFC;
+            ret = bosonGetFFCMode(&ffc_mode) == FLR_OK ? 0 : -1;
+            a->ivalue = ffc_mode;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_SET_FFC_TEMP_THRESHOLD: {
+            ret = bosonSetFFCTempThreshold(a->ivalue) == FLR_OK ? 0 : -1;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_GET_FFC_TEMP_THRESHOLD: {
+            uint16_t temp_threshold = 0;
+            ret = bosonGetFFCTempThreshold(&temp_threshold) == FLR_OK ? 0 : -1;
+            a->ivalue = temp_threshold;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_SET_FFC_FRAME_THRESHOLD: {
+            ret = bosonSetFFCFrameThreshold(a->ivalue) == FLR_OK ? 0 : -1;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_GET_FFC_FRAME_THRESHOLD: {
+            uint32_t frame_threshold = 0;
+            ret = bosonGetFFCFrameThreshold(&frame_threshold) == FLR_OK ? 0 : -1;
+            a->ivalue = frame_threshold;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_SET_FFC_NUM_FRAMES: {
+            ret = gaoSetNumFFCFrames(a->ivalue) == FLR_OK ? 0 : -1;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_GET_FFC_NUM_FRAMES: {
+            uint16_t num_frames = 0;
+            ret = gaoGetNumFFCFrames(&num_frames) == FLR_OK ? 0 : -1;
+            a->ivalue = num_frames;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_GET_RADIOMETRY_CAPABLE: {
+            FLR_ENABLE_E enable = FLR_DISABLE;
+            ret = radiometryGetRadiometryCapable(&enable) == FLR_OK ? 0 : -1;
+            a->ivalue = (enable == FLR_ENABLE);
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_SET_TLINEAR_ENABLE: {
+            ret = TLinearSetControl(a->ivalue ? FLR_ENABLE : FLR_DISABLE) == FLR_OK ? 0 : -1;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_GET_TLINEAR_ENABLE: {
+            FLR_ENABLE_E enable = FLR_DISABLE;
+            ret = TLinearGetControl(&enable) == FLR_OK ? 0 : -1;
+            a->ivalue = (enable == FLR_ENABLE);
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_SET_TEMP_STABLE_ENABLE: {
+            ret = radiometrySetTempStableEnable(a->ivalue ? FLR_ENABLE : FLR_DISABLE) == FLR_OK ? 0 : -1;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_GET_TEMP_STABLE_ENABLE: {
+            FLR_ENABLE_E enable = FLR_DISABLE;
+            ret = radiometryGetTempStableEnable(&enable) == FLR_OK ? 0 : -1;
+            a->ivalue = (enable == FLR_ENABLE);
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_SET_EMISSIVITY: {
+            ret = radiometrySetEmissivityTarget(a->fvalue) == FLR_OK ? 0 : -1;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_GET_EMISSIVITY: {
+            ret = radiometryGetEmissivityTarget(&a->fvalue) == FLR_OK ? 0 : -1;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_SET_TEMP_BACKGROUND: {
+            ret = radiometrySetTempBackground(a->fvalue) == FLR_OK ? 0 : -1;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_GET_TEMP_BACKGROUND: {
+            ret = radiometryGetTempBackground(&a->fvalue) == FLR_OK ? 0 : -1;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_SET_SPOT_METER_ENABLE: {
+            ret = spotMeterSetEnable(a->ivalue ? FLR_ENABLE : FLR_DISABLE) == FLR_OK ? 0 : -1;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_GET_SPOT_METER_ENABLE: {
+            FLR_ENABLE_E enable = FLR_DISABLE;
+            ret = spotMeterGetEnable(&enable) == FLR_OK ? 0 : -1;
+            a->ivalue = (enable == FLR_ENABLE);
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_SET_SPOT_METER_ROI: {
+            FLR_ROI_T roi;
+            roi.rowStart = a->roi.y;
+            roi.rowStop = a->roi.y + a->roi.h - 1;
+            roi.colStart = a->roi.x;
+            roi.colStop = a->roi.x + a->roi.w - 1;
+            ret = spotMeterSetRoi(roi) == FLR_OK ? 0 : -1;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_GET_SPOT_METER_ROI: {
+            FLR_ROI_T roi = {0};
+            ret = spotMeterGetRoi(&roi) == FLR_OK ? 0 : -1;
+            a->roi.x = roi.colStart;
+            a->roi.y = roi.rowStart;
+            a->roi.w = roi.colStop - roi.colStart + 1;
+            a->roi.h = roi.rowStop - roi.rowStart + 1;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_GET_SPOT_METER_ROI_MAX: {
+            uint16_t width = 0;
+            uint16_t height = 0;
+            ret = spotMeterGetRoiMaxSize(&width, &height) == FLR_OK ? 0 : -1;
+            a->roi_max.w = width;
+            a->roi_max.h = height;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_SET_SPOT_METER_MODE: {
+            ret = spotMeterSetStatsMode((FLR_SPOTMETER_STATS_TEMP_MODE_E) a->ivalue) == FLR_OK ? 0 : -1;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_GET_SPOT_METER_MODE: {
+            FLR_SPOTMETER_STATS_TEMP_MODE_E stats_mode = FLR_SPOTMETER_CELCIUS;
+            ret = spotMeterGetStatsMode(&stats_mode) == FLR_OK ? 0 : -1;
+            a->ivalue = stats_mode;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_GET_SPOT_METER_STATS: {
+            uint16_t mean16 = 0;
+            uint16_t deviation16 = 0;
+            FLR_SPOTMETER_SPOT_PARAM_T min = {0};
+            FLR_SPOTMETER_SPOT_PARAM_T max = {0};
+            ret = spotMeterGetSpotStats(&mean16, &deviation16, &min, &max) == FLR_OK ? 0 : -1;
+            a->stats.mean = mean16;
+            a->stats.deviation = deviation16;
+            a->stats.min_value = min.value;
+            a->stats.min_x = min.column;
+            a->stats.min_y = min.row;
+            a->stats.max_value = max.value;
+            a->stats.max_x = max.column;
+            a->stats.max_y = max.row;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_GET_SPOT_METER_TEMP_STATS: {
+            FLR_SPOTMETER_STAT_PARAM_TEMP_T min = {0};
+            FLR_SPOTMETER_STAT_PARAM_TEMP_T max = {0};
+            ret = spotMeterGetTempStats(&a->temp_stats.mean,
+                                        &a->temp_stats.deviation, &min, &max) == FLR_OK ? 0 : -1;
+            a->temp_stats.min_value = min.value;
+            a->temp_stats.min_x = min.column;
+            a->temp_stats.min_y = min.row;
+            a->temp_stats.max_value = max.value;
+            a->temp_stats.max_x = max.column;
+            a->temp_stats.max_y = max.row;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_GET_TEMP_FROM_COUNTS: {
+            ret = radiometryGetTempFromCounts((FLR_RADIOMETRY_RBFO_TYPE_E) a->temp_from_counts.rbfo_type,
+                                              a->temp_from_counts.counts,
+                                              &a->temp_from_counts.temp) == FLR_OK ? 0 : -1;
+            break;
+        }
+        case OMV_CSI_IOCTL_BOSON_GET_RBFO: {
+            int rbfo_type = a->rbfo.rbfo_type;
+            int low_gain = a->rbfo.low_gain;
+            FLR_RESULT result;
+            FLR_RADIOMETRY_RBFO_PARAMS_T params = {0};
+            if (rbfo_type == FLR_RADIOMETRY_FACTORY_RBFO) {
+                result = low_gain ? radiometryGetRBFOLowGainFactory(&params)
+                                  : radiometryGetRBFOHighGainFactory(&params);
+            } else {
+                result = low_gain ? radiometryGetRBFOLowGainDefault(&params)
+                                  : radiometryGetRBFOHighGainDefault(&params);
+            }
+            ret = result == FLR_OK ? 0 : -1;
+            a->rbfo.r = params.RBFO_R;
+            a->rbfo.b = params.RBFO_B;
+            a->rbfo.f = params.RBFO_F;
+            a->rbfo.o = params.RBFO_O;
+            break;
+        }
+        default: {
+            ret = -1;
+            break;
+        }
+    }
+
+    return ret;
+}
+
 int boson_init(omv_csi_t *csi) {
     // Initialize csi structure
     csi->reset = reset;
@@ -160,6 +389,7 @@ int boson_init(omv_csi_t *csi) {
     csi->set_framesize = set_framesize;
     csi->set_colorbar = set_colorbar;
     csi->post_process = post_process;
+    csi->ioctl = ioctl;
 
     // Set csi flags
     csi->vsync_pol = 0;

@@ -134,10 +134,10 @@
 #define OMV_GC_BLOCK1_MEMORY                  SRAM4     // Extra GC block 1.
 #define OMV_GC_BLOCK1_SIZE                    (63K)
 #define OMV_GC_BLOCK2_MEMORY                  SRAM1     // Extra GC block 2.
-#define OMV_GC_BLOCK2_SIZE                    (276K)
+#define OMV_GC_BLOCK2_SIZE                    (272K)
 #define OMV_UMA_BLOCK0_MEMORY                 SRAM0     // Default UMA pool.
 #define OMV_UMA_BLOCK0_SIZE                   (476K)
-#define OMV_UMA_BLOCK0_FLAGS                  (0)
+#define OMV_UMA_BLOCK0_FLAGS                  (UMA_DEFAULT)
 #define OMV_MSC_BUF_SIZE                      (2K)      // USB MSC bot data
 #define OMV_LINE_BUF_SIZE                     (3 * 1024) // Image line buffer round(640 * 2BPP * 2 buffers).
 #define OMV_VOSPI_DMA_BUFFER                  ".dma_buffer"
@@ -152,9 +152,9 @@
 #define OMV_SRAM0_ORIGIN                      0x24000000
 #define OMV_SRAM0_LENGTH                      512K
 #define OMV_SRAM1_ORIGIN                      0x30000000
-#define OMV_SRAM1_LENGTH                      276K
-#define OMV_SRAM2_ORIGIN                      0x30045000
-#define OMV_SRAM2_LENGTH                      12K
+#define OMV_SRAM1_LENGTH                      272K
+#define OMV_SRAM2_ORIGIN                      0x30044000
+#define OMV_SRAM2_LENGTH                      16K
 #define OMV_SRAM4_ORIGIN                      0x38000000
 #define OMV_SRAM4_LENGTH                      64K
 

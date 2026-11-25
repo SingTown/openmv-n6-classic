@@ -42,7 +42,7 @@
 
 #define OMV_FIRMWARE_VERSION_MAJOR          (5)
 #define OMV_FIRMWARE_VERSION_MINOR          (0)
-#define OMV_FIRMWARE_VERSION_PATCH          (0)
+#define OMV_FIRMWARE_VERSION_PATCH          (1)
 
 #define OMV_PROTOCOL_VERSION_MAJOR          (1)
 #define OMV_PROTOCOL_VERSION_MINOR          (0)
@@ -52,7 +52,6 @@
 #define OMV_PROTOCOL_SYNC_WORD              (0xD5AA)
 #define OMV_PROTOCOL_HEADER_SIZE            (10)    // SYNC[2] SEQ[1] CHAN[1] FLAGS[1] OPCODE[1] LEN[2] CRC[2]
 
-#define OMV_PROTOCOL_MAX_CHANNELS           (32)
 #define OMV_PROTOCOL_DEF_POLL_MS            (50)
 #define OMV_PROTOCOL_DEF_RTX_RETRIES        (3)
 #define OMV_PROTOCOL_DEF_RTX_TIMEOUT_MS     (500)   // Doubled after each timeout
@@ -341,6 +340,7 @@ typedef struct {
 typedef struct {
     // State machine
     uint8_t sequence;           // Next sequence number
+    bool suspended;             // Host packets are not consumed (soft reboot in progress)
     uint32_t last_lock_ms;      // Timestamp of the last successful lock
     int32_t scan_offset;
     bool wait_for_ack;
@@ -360,7 +360,7 @@ typedef struct {
 
     // Protocol physical/logical channels
     uint8_t channels_count;
-    const omv_protocol_channel_t *channels[OMV_PROTOCOL_MAX_CHANNELS];
+    const omv_protocol_channel_t *channels[OMV_PROTOCOL_CHANNEL_MAX];
 
     // Protocol Statistics
     omv_protocol_stats_t stats;
