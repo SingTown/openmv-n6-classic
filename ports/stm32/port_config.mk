@@ -189,6 +189,13 @@ $(ROMFS_IMAGE): $(ROMFS_CONFIG) $(wildcard $(TOP_DIR)/lib/stai/scripts/*) | $(FI
         --out-dir $(FW_DIR) \
         --build-dir $(BUILD)/lib/models \
         $(STEDGEAI_ARGS) --config $(ROMFS_CONFIG)
+ifeq ($(MICROPY_PY_ML_STAI), 1)
+	# Ship the conversion settings these models were built with, for OpenMV IDE.
+	$(PYTHON) $(TOOLS_DIR)/stai_export.py \
+        --top-dir $(TOP_DIR) \
+        --out-dir $(FW_DIR) \
+        --config $(ROMFS_CONFIG)
+endif
 	touch $@
 
 deploy: $(ROMFS_IMAGE)
